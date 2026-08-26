@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, TypeVar
@@ -206,6 +207,7 @@ class JourneyService:
         return self._response(journey.id, transitions)
 
     def continue_journey(self, journey_id: str) -> dict[str, Any]:
+        """Compatibility shortcut; the conversational agent uses explicit steps."""
         pipeline = {
             JourneyState.APM_VALIDATED: JourneyState.COLLECTING_INVENTORY,
             JourneyState.COLLECTING_INVENTORY: JourneyState.INVENTORY_COMPLETE,
@@ -240,7 +242,216 @@ class JourneyService:
             note="Human approval is required before provisioning can continue.",
         )
 
+    def guidance(self, question: str, journey_id: str = "") -> dict[str, Any]:
+        """Provide state-aware discovery guidance without changing business state."""
+        question = question.strip()
+        if not question:
+            raise ValueError("question must not be empty")
+
+        response: dict[str, Any] = {
+            "ok": True,
+            "question": question,
+            "guidance": (
+                "Cloud Compass starts with application discovery: business criticality, "
+                "current hosting, environments, dependencies, data classification, "
+                "availability needs, target outcomes, and delivery constraints. It uses "
+                "that knowledge to prepare a reviewable plan before provisioning."
+            ),
+        }
+        if not journey_id.strip():
+            response["recommended_next_action"] = (
+                "Start a Journey when you want this discovery to become durable work."
+            )
+            return response
+
+        journey = self.state_machine.get_journey(journey_id.strip())
+        state = JourneyState(journey.status)
+        next_steps: dict[JourneyState, tuple[list[str], str]] = {
+            JourneyState.APM_VALIDATED: (
+                [
+                    "application name",
+                    "business criticality",
+                    "current platform",
+                    "environments",
+                    "dependencies",
+                    "data classification",
+                    "availability requirement",
+                ],
+                "Record the application inventory after the owner provides these facts.",
+            ),
+            JourneyState.INVENTORY_COMPLETE: (
+                ["target platform", "migration objectives", "constraints"],
+                "Discuss options, then generate a proposed Cloud plan.",
+            ),
+            JourneyState.WAITING_FOR_APPROVAL: (
+                [],
+                "The plan is ready. An independent CLOUD_JOURNEY_APPROVERS member must review it.",
+            ),
+            JourneyState.COMPLETED: ([], "The simulated Journey is complete."),
+            JourneyState.REJECTED: (
+                [],
+                "Review the rejection reason before starting a revised Journey.",
+            ),
+        }
+        required, next_action = next_steps.get(
+            state,
+            ([], f"The Journey is currently processing the {journey.current_step} step."),
+        )
+        response.update(
+            {
+                "journey_id": journey.id,
+                "current_state": journey.status,
+                "known_context": journey.context,
+                "information_needed": required,
+                "recommended_next_action": next_action,
+            }
+        )
+        return response
+
+    def record_inventory(
+        self,
+        journey_id: str,
+        application_name: str,
+        business_criticality: str,
+        current_platform: str,
+        environments: str,
+        dependencies: str,
+        data_classification: str,
+        availability_requirement: str,
+    ) -> dict[str, Any]:
+        """Persist owner-provided application knowledge and complete discovery."""
+        inventory = {
+            "application_name": application_name.strip(),
+            "business_criticality": business_criticality.strip(),
+            "current_platform": current_platform.strip(),
+            "environments": environments.strip(),
+            "dependencies": dependencies.strip(),
+            "data_classification": data_classification.strip(),
+            "availability_requirement": availability_requirement.strip(),
+        }
+        missing = [key for key, value in inventory.items() if not value]
+        if missing:
+            raise ValueError(f"Missing inventory fields: {', '.join(missing)}")
+
+        def action() -> list[TransitionResult]:
+            transitions: list[TransitionResult] = []
+            journey = self.state_machine.get_journey(journey_id)
+            current = JourneyState(journey.status)
+            if current == JourneyState.APM_VALIDATED:
+                transitions.append(
+                    self.state_machine.transition(
+                        journey_id,
+                        JourneyState.COLLECTING_INVENTORY,
+                        actor=AGENT_ACTOR,
+                        message="Started application discovery and inventory collection",
+                    )
+                )
+                current = JourneyState.COLLECTING_INVENTORY
+            if current not in {
+                JourneyState.COLLECTING_INVENTORY,
+                JourneyState.INVENTORY_COMPLETE,
+            }:
+                self.state_machine.transition(
+                    journey_id,
+                    JourneyState.COLLECTING_INVENTORY,
+                    actor=AGENT_ACTOR,
+                )
+            self.state_machine.merge_context(
+                journey_id,
+                {"inventory": inventory},
+                actor=Actor("USER", journey.requested_by),
+                message="Application inventory supplied by the Journey requester",
+            )
+            if current == JourneyState.COLLECTING_INVENTORY:
+                transitions.append(
+                    self.state_machine.transition(
+                        journey_id,
+                        JourneyState.INVENTORY_COMPLETE,
+                        actor=AGENT_ACTOR,
+                        message="Application discovery and inventory are complete",
+                    )
+                )
+            return transitions
+
+        transitions = self._run_operation(journey_id, "RECORD_INVENTORY", action)
+        return self._response(
+            journey_id,
+            transitions,
+            note="Application knowledge is durable. Discuss the target approach before generating a plan.",
+        )
+
+    def generate_plan(
+        self,
+        journey_id: str,
+        target_platform: str,
+        migration_objectives: str,
+        constraints: str,
+    ) -> dict[str, Any]:
+        """Generate and persist a transparent simulated plan for human review."""
+        inputs = {
+            "target_platform": target_platform.strip(),
+            "migration_objectives": migration_objectives.strip(),
+            "constraints": constraints.strip(),
+        }
+        missing = [key for key, value in inputs.items() if not value]
+        if missing:
+            raise ValueError(f"Missing planning fields: {', '.join(missing)}")
+
+        def action() -> list[TransitionResult]:
+            transitions: list[TransitionResult] = []
+            current = JourneyState(self.state_machine.get_journey(journey_id).status)
+            if current == JourneyState.INVENTORY_COMPLETE:
+                transitions.append(
+                    self.state_machine.transition(
+                        journey_id,
+                        JourneyState.GENERATING_PLAN,
+                        actor=AGENT_ACTOR,
+                        message="Started generating a plan from captured application knowledge",
+                    )
+                )
+                current = JourneyState.GENERATING_PLAN
+            if current != JourneyState.GENERATING_PLAN:
+                self.state_machine.transition(
+                    journey_id,
+                    JourneyState.GENERATING_PLAN,
+                    actor=AGENT_ACTOR,
+                )
+            plan = {
+                **inputs,
+                "steps": [
+                    "Validate target landing-zone and security prerequisites",
+                    "Prepare application and dependency migration",
+                    "Migrate data using an approved cutover approach",
+                    "Run functional, security, and availability validation",
+                    "Complete controlled cutover and post-migration review",
+                ],
+                "provisioning": "simulated",
+            }
+            self.state_machine.merge_context(
+                journey_id,
+                {"proposed_plan": plan},
+                actor=AGENT_ACTOR,
+                message="Generated a simulated Cloud Journey plan",
+            )
+            transitions.append(
+                self.state_machine.transition(
+                    journey_id,
+                    JourneyState.WAITING_FOR_APPROVAL,
+                    actor=AGENT_ACTOR,
+                    message="Plan is ready for independent human review",
+                )
+            )
+            return transitions
+
+        transitions = self._run_operation(journey_id, "GENERATE_PLAN", action)
+        return self._response(
+            journey_id,
+            transitions,
+            note="The proposed plan is ready for independent approval; no resources were provisioned.",
+        )
+
     def approve(self, journey_id: str, user_name: str) -> dict[str, Any]:
+        """Compatibility API; Cloud Compass does not expose this to chat."""
         user = self._user(user_name)
 
         def action() -> list[TransitionResult]:
@@ -291,6 +502,7 @@ class JourneyService:
         return self._response(journey_id, transitions, note="Provisioning was simulated.")
 
     def reject(self, journey_id: str, user_name: str, reason: str) -> dict[str, Any]:
+        """Compatibility API; Cloud Compass does not expose this to chat."""
         user = self._user(user_name)
         reason = reason.strip()
         if not reason:
@@ -318,6 +530,169 @@ class JourneyService:
         transitions = self._run_operation(journey_id, "REJECT_JOURNEY", action)
         return self._response(journey_id, transitions, note=f"Rejection reason: {reason}")
 
+    def record_external_approval(
+        self, journey_id: str, reviewer_name: str
+    ) -> dict[str, Any]:
+        """Approval-backend boundary: persist a decision without executing work."""
+        reviewer = self._user(reviewer_name)
+
+        def action() -> list[TransitionResult]:
+            decision = self._require_approval_authorization(
+                journey_id, reviewer, "approve"
+            )
+            return [
+                self.state_machine.transition(
+                    journey_id,
+                    JourneyState.APPROVED,
+                    actor=Actor("APPROVAL_BACKEND", reviewer.name),
+                    message=f"External approval received from {reviewer.name}",
+                    metadata={
+                        "reviewer_role": reviewer.role,
+                        "reviewer_groups": sorted(reviewer.groups),
+                        "authorization_basis": decision.required_group,
+                        "source": "external-approval-backend",
+                    },
+                )
+            ]
+
+        transitions = self._run_operation(journey_id, "EXTERNAL_APPROVAL", action)
+        return self._response(
+            journey_id,
+            transitions,
+            note="The external approval backend persisted APPROVED. Execution has not resumed yet.",
+        )
+
+    def record_external_rejection(
+        self, journey_id: str, reviewer_name: str, reason: str
+    ) -> dict[str, Any]:
+        """Approval-backend boundary: persist an external rejection."""
+        reviewer = self._user(reviewer_name)
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("A rejection reason is required")
+
+        def action() -> list[TransitionResult]:
+            decision = self._require_approval_authorization(
+                journey_id, reviewer, "reject"
+            )
+            return [
+                self.state_machine.transition(
+                    journey_id,
+                    JourneyState.REJECTED,
+                    actor=Actor("APPROVAL_BACKEND", reviewer.name),
+                    message=reason,
+                    metadata={
+                        "reviewer_role": reviewer.role,
+                        "reviewer_groups": sorted(reviewer.groups),
+                        "authorization_basis": decision.required_group,
+                        "source": "external-approval-backend",
+                        "rejection_reason": reason,
+                    },
+                )
+            ]
+
+        transitions = self._run_operation(journey_id, "EXTERNAL_REJECTION", action)
+        return self._response(
+            journey_id,
+            transitions,
+            note=f"The external approval backend persisted REJECTED: {reason}",
+        )
+
+    def wait_for_approval(
+        self,
+        journey_id: str,
+        timeout_seconds: int = 120,
+        poll_interval_seconds: int = 2,
+    ) -> dict[str, Any]:
+        """Poll durable state only; this method cannot create an approval."""
+        if timeout_seconds < 0 or timeout_seconds > 120:
+            raise ValueError("timeout_seconds must be between 0 and 120 for this PoC")
+        if poll_interval_seconds < 1 or poll_interval_seconds > 30:
+            raise ValueError("poll_interval_seconds must be between 1 and 30")
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            observed_state = JourneyState(
+                self.state_machine.get_journey(journey_id).status
+            )
+            if observed_state in {
+                JourneyState.APPROVED,
+                JourneyState.REJECTED,
+                JourneyState.COMPLETED,
+            }:
+                break
+            if observed_state != JourneyState.WAITING_FOR_APPROVAL:
+                raise InvalidTransition(journey_id, observed_state, JourneyState.APPROVED)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(float(poll_interval_seconds), remaining))
+
+        response = self._response(journey_id, [])
+        response.update(
+            {
+                "approval_observed": observed_state
+                in {JourneyState.APPROVED, JourneyState.COMPLETED},
+                "decision": (
+                    observed_state.value
+                    if observed_state
+                    in {JourneyState.APPROVED, JourneyState.REJECTED}
+                    else None
+                ),
+                "timed_out": observed_state == JourneyState.WAITING_FOR_APPROVAL,
+                "waited_up_to_seconds": timeout_seconds,
+            }
+        )
+        if response["timed_out"]:
+            response["note"] = (
+                "No external decision was observed during this wait. The Journey "
+                "remains WAITING_FOR_APPROVAL; check again later."
+            )
+        elif observed_state == JourneyState.APPROVED:
+            response["note"] = (
+                "External APPROVED was observed in PostgreSQL. Cloud Compass may now resume execution."
+            )
+        elif observed_state == JourneyState.REJECTED:
+            response["note"] = (
+                "External REJECTED was observed in PostgreSQL. Execution will not resume."
+            )
+        return response
+
+    def resume_after_approval(self, journey_id: str) -> dict[str, Any]:
+        """Resume simulated execution only after the database says APPROVED."""
+        pipeline = {
+            JourneyState.APPROVED: JourneyState.PROVISIONING,
+            JourneyState.PROVISIONING: JourneyState.VALIDATING_RESULT,
+            JourneyState.VALIDATING_RESULT: JourneyState.COMPLETED,
+        }
+
+        def action() -> list[TransitionResult]:
+            transitions: list[TransitionResult] = []
+            while True:
+                current = JourneyState(self.state_machine.get_journey(journey_id).status)
+                if current == JourneyState.COMPLETED:
+                    break
+                target = pipeline.get(current)
+                if target is None:
+                    # The central validator rejects execution without external approval.
+                    target = JourneyState.PROVISIONING
+                transitions.append(
+                    self.state_machine.transition(
+                        journey_id,
+                        target,
+                        actor=AGENT_ACTOR,
+                        message=f"Resumed after external approval: {target.value}",
+                    )
+                )
+            return transitions
+
+        transitions = self._run_operation(journey_id, "RESUME_AFTER_APPROVAL", action)
+        return self._response(
+            journey_id,
+            transitions,
+            note="External approval was observed; provisioning and validation were simulated.",
+        )
+
     def status(self, journey_id: str) -> dict[str, Any]:
         return self._response(journey_id, [])
 
@@ -342,6 +717,7 @@ class JourneyService:
             "requested_by_email": journey.requested_by_email,
             "role": journey.role,
             "last_error": journey.last_error,
+            "context": journey.context,
             "transitions": [_transition_dict(item) for item in transitions],
             "state_path": [
                 event.to_state
@@ -410,18 +786,54 @@ def start_journey(apm_id: str, user_name: str) -> dict[str, Any]:
 
 
 def continue_journey(journey_id: str) -> dict[str, Any]:
-    """Continue a Journey through plan generation, stopping for human approval."""
+    """Compatibility shortcut that advances through discovery and planning states."""
     return _tool_call(lambda: get_service().continue_journey(journey_id))
 
 
-def approve_journey(journey_id: str, user_name: str) -> dict[str, Any]:
-    """Approve a waiting Journey as a simulated user, then simulate execution."""
-    return _tool_call(lambda: get_service().approve(journey_id, user_name))
+def get_cloud_journey_guidance(
+    question: str, journey_id: str = ""
+) -> dict[str, Any]:
+    """Answer a discovery question and explain what information the Journey needs next."""
+    return _tool_call(lambda: get_service().guidance(question, journey_id))
 
 
-def reject_journey(journey_id: str, user_name: str, reason: str) -> dict[str, Any]:
-    """Reject a waiting Journey as a simulated approver and persist the reason."""
-    return _tool_call(lambda: get_service().reject(journey_id, user_name, reason))
+def record_application_inventory(
+    journey_id: str,
+    application_name: str,
+    business_criticality: str,
+    current_platform: str,
+    environments: str,
+    dependencies: str,
+    data_classification: str,
+    availability_requirement: str,
+) -> dict[str, Any]:
+    """Record application discovery facts supplied by the owner in durable storage."""
+    return _tool_call(
+        lambda: get_service().record_inventory(
+            journey_id,
+            application_name,
+            business_criticality,
+            current_platform,
+            environments,
+            dependencies,
+            data_classification,
+            availability_requirement,
+        )
+    )
+
+
+def generate_cloud_plan(
+    journey_id: str,
+    target_platform: str,
+    migration_objectives: str,
+    constraints: str,
+) -> dict[str, Any]:
+    """Generate a simulated Cloud plan from captured knowledge and submit it for review."""
+    return _tool_call(
+        lambda: get_service().generate_plan(
+            journey_id, target_platform, migration_objectives, constraints
+        )
+    )
 
 
 def get_journey_status(journey_id: str) -> dict[str, Any]:
@@ -429,12 +841,19 @@ def get_journey_status(journey_id: str) -> dict[str, Any]:
     return _tool_call(lambda: get_service().status(journey_id))
 
 
-def check_approval_authorization(
-    journey_id: str, user_name: str, action: str
+def wait_for_external_approval(
+    journey_id: str,
+    timeout_seconds: int = 120,
+    poll_interval_seconds: int = 2,
 ) -> dict[str, Any]:
-    """Check whether a simulated user may approve or reject a Journey and explain why."""
+    """Wait briefly for an external backend to write APPROVED or REJECTED to PostgreSQL."""
     return _tool_call(
-        lambda: get_service().check_approval_authorization(
-            journey_id, user_name, action
+        lambda: get_service().wait_for_approval(
+            journey_id, timeout_seconds, poll_interval_seconds
         )
     )
+
+
+def resume_journey_after_approval(journey_id: str) -> dict[str, Any]:
+    """Resume simulated execution only when PostgreSQL already contains APPROVED."""
+    return _tool_call(lambda: get_service().resume_after_approval(journey_id))

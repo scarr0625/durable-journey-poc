@@ -19,11 +19,40 @@ def test_normal_journey_stops_for_approval_then_completes(service) -> None:
         "VALIDATING_APM",
         "APM_VALIDATED",
     ]
-    waiting = service.continue_journey(journey_id)
+    guidance = service.guidance(
+        "What do you need to know about this application?", journey_id
+    )
+    assert guidance["current_state"] == "APM_VALIDATED"
+    assert "dependencies" in guidance["information_needed"]
+
+    inventory = service.record_inventory(
+        journey_id,
+        "Customer Orders API",
+        "Tier 1",
+        "On-premises VMware",
+        "development, test, and production",
+        "PostgreSQL, Active Directory, and an external payment gateway",
+        "confidential customer data",
+        "99.95% availability with disaster recovery",
+    )
+    assert inventory["current_state"] == "INVENTORY_COMPLETE"
+    assert inventory["context"]["inventory"]["application_name"] == "Customer Orders API"
+
+    waiting = service.generate_plan(
+        journey_id,
+        "Google Kubernetes Engine with Cloud SQL for PostgreSQL",
+        "improve resilience and reduce infrastructure operations",
+        "no more than 15 minutes of cutover downtime; retain private connectivity",
+    )
     assert waiting["current_state"] == "WAITING_FOR_APPROVAL"
     assert waiting["version"] == 7
+    assert waiting["context"]["proposed_plan"]["provisioning"] == "simulated"
 
-    completed = service.approve(journey_id, "reviewer")
+    external_decision = service.record_external_approval(journey_id, "reviewer")
+    assert external_decision["current_state"] == "APPROVED"
+    assert external_decision["version"] == 8
+
+    completed = service.resume_after_approval(journey_id)
     assert completed["current_state"] == "COMPLETED"
     assert completed["version"] == 11
     assert completed["state_path"][-4:] == [

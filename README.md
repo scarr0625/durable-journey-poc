@@ -13,7 +13,7 @@ table.
 - Resumable simulated inventory, planning, provisioning, and validation stages
 - Segregated approval boundary based on `CLOUD_JOURNEY_APPROVERS` membership
 - `journey_operations` records for command outcomes and future idempotency/retry work
-- Six Google ADK tools and a `root_agent` suitable for ADK Web
+- Seven purpose-specific Google ADK tools and a `root_agent` suitable for ADK Web
 - Self-contained unit/acceptance tests, including process restart and conflicting actions
 
 No real cloud resources are provisioned and no OAuth tokens are stored.
@@ -59,38 +59,42 @@ configuration defaults to PostgreSQL, and the same transition code executes
 `SELECT ... FOR UPDATE`; the optimistic version predicate adds protection on
 backends that do not implement row locks.
 
-## Simulated identities and separation of duties
+## Approval boundary
 
-| User | Business role | Simulated AD groups | May request | May approve/reject |
-|---|---|---|---:|---:|
-| `sam` | `PROJECT_OWNER` | none | Yes | No |
-| `reviewer` | `REVIEWER` | `CLOUD_JOURNEY_APPROVERS` | Yes | Yes, except own requests |
-| `developer` | `DEVELOPER` | none | Yes | No |
+Cloud Compass has no approve or reject control. It creates knowledge and plans,
+then stops at `WAITING_FOR_APPROVAL`. A separate approval backend owns the human
+decision and writes `APPROVED` or `REJECTED` to PostgreSQL.
 
-Project ownership does not imply approval authority. Approval and rejection
-require membership in the separate `CLOUD_JOURNEY_APPROVERS` group, and the
-requester cannot approve or reject their own request. This models an enterprise
-AD-group decision without connecting to real Active Directory. The simulated
-identity provider is isolated in `cloud_journey/authorization.py` so validated
-SSO/OAuth claims can replace it later.
+The local simulator models that backend with these identities:
 
-The read-only authorization-check tool explains a decision, but it is not a
-security prerequisite. Both mutation tools evaluate the policy again before
-changing state, so an LLM cannot bypass authorization by skipping the check.
+| User | Business role | Simulated AD groups | Cloud Compass access | Approval-backend access |
+|---|---|---|---|---|
+| `sam` | `PROJECT_OWNER` | none | Requester | None |
+| `reviewer` | `REVIEWER` | `CLOUD_JOURNEY_APPROVERS` | Status only | Approve/reject others' requests |
+| `developer` | `DEVELOPER` | none | Knowledge/status | None |
+
+Cloud Compass can only poll the database and observe the backend decision. It can
+resume provisioning after it reads `APPROVED`; it cannot create that state. The
+simulator waits 60 seconds by default. A real seven-day approval must use an
+event/callback or durable workflow timer rather than keeping an ADK request open.
 
 ## ADK tools
 
 | Tool | Purpose | Changes Journey state |
 |---|---|---:|
 | `start_journey(apm_id, user_name)` | Create the durable Journey and simulate APM validation | Yes |
-| `continue_journey(journey_id)` | Collect inventory and generate a plan, stopping at approval | Yes |
-| `check_approval_authorization(journey_id, user_name, action)` | Explain whether `approve` or `reject` is allowed | No |
-| `approve_journey(journey_id, user_name)` | Enforce approval policy and simulate provisioning through completion | Yes |
-| `reject_journey(journey_id, user_name, reason)` | Enforce approval policy and persist the rejection reason | Yes |
+| `get_cloud_journey_guidance(question, journey_id)` | Answer using persisted Journey context and identify missing discovery facts | No |
+| `record_application_inventory(...)` | Persist application, platform, dependency, data, and availability knowledge | Yes |
+| `generate_cloud_plan(...)` | Persist a proposed target plan and submit it for independent review | Yes |
+| `wait_for_external_approval(journey_id, timeout_seconds, poll_interval_seconds)` | Poll PostgreSQL for an external decision for up to two minutes | No |
+| `resume_journey_after_approval(journey_id)` | Continue simulated execution only if PostgreSQL already says `APPROVED` | Yes |
 | `get_journey_status(journey_id)` | Read current state, version, requester, and complete audit history | No |
 
-All mutation tools delegate state changes to the central state machine. The ADK
-agent and authorization layer cannot update Journey status directly.
+Neither approval nor rejection is registered as an ADK tool. The backend-only
+simulator is a separate module, `cloud_journey.approval_backend`. All state changes
+still pass through the central state machine. The original `continue_journey`
+function remains a compatibility API for the initial PoC contract, but Cloud
+Compass cannot call it.
 
 ## Run ADK Web
 
@@ -108,63 +112,112 @@ Use the messages below in order. Replace `J-XXXXXXXX` with the Journey ID return
 by the first message when starting a new chat; within one chat, “the journey”
 should resolve to the prior tool result.
 
-### Demo 1: owner requests, owner and developer are denied, reviewer approves
+### Demo 1: knowledge discovery, external approval, and automatic resume
 
 ```text
+Before I start, explain what Cloud Compass can help me with during an application cloud journey.
+
 Start a Cloud Journey for APM 100200 as sam.
 
-Continue the journey.
+What do you need to know about this application before recommending a cloud plan?
 
-Can sam approve the journey?
+The application is Customer Orders API. It is a Tier 1 business service currently
+running on on-premises VMware. It has development, test, and production environments.
+Its dependencies are PostgreSQL, Active Directory, and an external payment gateway.
+It processes confidential customer data and requires 99.95% availability with
+disaster recovery.
 
-Approve the journey as sam.
+Based on this inventory, explain reasonable migration options and the tradeoffs
+between GKE, Cloud Run, and a VM-based migration.
 
-Show status for the journey.
+Create a proposed plan targeting Google Kubernetes Engine with Cloud SQL for
+PostgreSQL. The objectives are improved resilience and reduced infrastructure
+operations. Constraints are no more than 15 minutes of cutover downtime and all
+application traffic must use private connectivity.
 
-Can developer approve the journey?
+Show me the proposed plan and current Journey status.
 
-Approve the journey as developer.
-
-Can reviewer approve the journey?
-
-Approve the journey as reviewer.
-
-Show the full history for the journey.
+Who is responsible for approving this Journey, and can approval happen here?
 ```
 
 Expected checkpoints:
 
-- `sam` creates the request as `PROJECT_OWNER`.
-- Execution stops at `WAITING_FOR_APPROVAL`, version 7.
-- Authorization checks for `sam` and `developer` return `authorized: false`.
-- Their approval attempts return `403 / AuthorizationDenied`; state remains
-  `WAITING_FOR_APPROVAL` and denial events appear in history.
-- `reviewer` returns `authorized: true` due to approval-group membership.
-- Reviewer approval produces `APPROVED -> PROVISIONING -> VALIDATING_RESULT -> COMPLETED`.
+- Cloud Compass begins as a knowledge assistant, not as a workflow command menu.
+- `sam` creates the durable request as `PROJECT_OWNER`.
+- The discovery question lists the application facts still needed.
+- The owner-provided inventory is persisted before any plan is generated.
+- Cloud Compass explains options using the captured inventory.
+- Plan generation produces `COLLECTING_INVENTORY -> INVENTORY_COMPLETE ->
+  GENERATING_PLAN -> WAITING_FOR_APPROVAL`, version 7.
+- Cloud Compass explains that the external approval backend owns the decision and
+  no approval action is available in chat.
+
+In a second terminal, mimic the approval backend. Replace the ID and use 60–120
+seconds for the visible demo:
+
+```powershell
+python -m cloud_journey.approval_backend J-XXXXXXXX --decision approve --reviewer reviewer --delay-seconds 60
+```
+
+Immediately return to Cloud Compass and send:
+
+```text
+Wait up to two minutes for the external approval decision. If the database says
+APPROVED, resume the Journey and show me the completed transition history.
+```
+
+Cloud Compass polls without changing state. After the backend writes `APPROVED`,
+it observes that value and invokes the separate resume tool:
+
+```text
+WAITING_FOR_APPROVAL
+→ APPROVED                  Actor: APPROVAL_BACKEND / reviewer
+→ PROVISIONING              Actor: AGENT / project-factory-agent
+→ VALIDATING_RESULT         Actor: AGENT / project-factory-agent
+→ COMPLETED                 Actor: AGENT / project-factory-agent
+```
 
 ### Demo 2: independent reviewer rejects with a persisted reason
 
 ```text
 Start a Cloud Journey for APM 200300 as sam.
 
-Continue the journey.
+The application is Partner Portal. It is a Tier 2 service on Windows VMs with
+development and production environments. Dependencies are SQL Server, corporate
+Active Directory, and an SMTP relay. It contains internal confidential data and
+requires 99.9% availability.
 
-Reject the journey as reviewer because the network firewall design is incomplete.
+Create a proposed plan targeting Compute Engine. The objective is a low-change
+migration. Constraints are private connectivity and the existing Windows runtime.
 
-Show status for the journey.
-
-Show the full history for the journey.
+Who is responsible for the decision? Confirm that I cannot reject it from Cloud Compass.
 ```
 
-Expected final state: `REJECTED`. The history shows `reviewer` as the user actor
-and preserves the complete rejection reason.
+In the separate backend terminal:
+
+```powershell
+python -m cloud_journey.approval_backend J-XXXXXXXX --decision reject --reviewer reviewer --delay-seconds 60 --reason "Network firewall design is incomplete"
+```
+
+Then ask Cloud Compass:
+
+```text
+Wait up to two minutes for the external decision and show the current status.
+```
+
+Expected final state: `REJECTED`. Cloud Compass observes it and does not resume.
 
 ### Demo 3: restart proves durable recovery
 
 ```text
 Start a Cloud Journey for APM 300400 as sam.
 
-Continue the journey.
+The application is Reporting Service. It is Tier 2, runs on Linux VMs, has test
+and production environments, depends on PostgreSQL and SFTP, contains internal
+data, and requires 99.9% availability.
+
+Create a proposed plan targeting Cloud Run with Cloud SQL. The objective is to
+reduce operations effort. Constraints are private database access and a phased cutover.
 ```
 
 Record the returned ID, stop ADK Web, restart it, open a new conversation, then
@@ -173,13 +226,13 @@ send:
 ```text
 Show status for journey J-XXXXXXXX.
 
-Can reviewer approve journey J-XXXXXXXX?
-
-Approve journey J-XXXXXXXX as reviewer.
+Wait up to two minutes for an external approval of journey J-XXXXXXXX. If it is
+approved, resume execution.
 ```
 
-The first response after restart must load `WAITING_FOR_APPROVAL` from PostgreSQL,
-and the reviewer can then complete it.
+The first response after restart must load `WAITING_FOR_APPROVAL` from PostgreSQL.
+Run the backend simulator in another terminal; Cloud Compass then detects its
+database update and resumes without any approval action in the chat UI.
 
 ## Data and transaction behavior
 

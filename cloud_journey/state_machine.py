@@ -240,6 +240,42 @@ class StateMachine:
                 )
             )
 
+    def merge_context(
+        self,
+        journey_id: str,
+        updates: dict[str, Any],
+        *,
+        actor: Actor,
+        message: str,
+    ) -> dict[str, Any]:
+        """Persist gathered Journey knowledge without changing its state/version."""
+        with self._session_factory.begin() as session:
+            journey = session.execute(
+                select(Journey).where(Journey.id == journey_id).with_for_update()
+            ).scalar_one_or_none()
+            if journey is None:
+                raise JourneyNotFound(journey_id)
+            merged = dict(journey.context or {})
+            merged.update(updates)
+            session.execute(
+                update(Journey)
+                .where(Journey.id == journey_id)
+                .values(context=merged)
+            )
+            session.add(
+                JourneyEvent(
+                    journey_id=journey_id,
+                    event_type="CONTEXT_UPDATED",
+                    from_state=journey.status,
+                    to_state=journey.status,
+                    actor_type=actor.actor_type,
+                    actor_id=actor.actor_id,
+                    message=message,
+                    event_metadata={"updated_sections": sorted(updates)},
+                )
+            )
+            return merged
+
     def get_journey(self, journey_id: str) -> Journey:
         with self._session_factory() as session:
             journey = session.get(Journey, journey_id)
