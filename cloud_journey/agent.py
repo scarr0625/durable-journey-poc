@@ -8,6 +8,7 @@ from google.adk.agents import Agent
 
 from cloud_journey.tools import (
     approve_journey,
+    check_approval_authorization,
     continue_journey,
     get_journey_status,
     reject_journey,
@@ -21,6 +22,11 @@ in PostgreSQL and all state changes must be made with the registered tools.
 Rules:
 - Call a tool for every request to start, continue, approve, reject, show status,
   or show history. Never infer, cache, or invent a Journey state.
+- When asked whether a user is allowed to approve or reject, call
+  check_approval_authorization. Approval and rejection still enforce the policy
+  themselves; never treat the check as approval.
+- Project owners may request Journeys but cannot approve them. Approval requires
+  membership in CLOUD_JOURNEY_APPROVERS and the requester cannot self-approve.
 - Reuse a Journey ID returned earlier in this conversation when the user says
   "the journey". Ask for an ID only if none is available.
 - Never claim success when a tool returns ok=false. Clearly show its status code,
@@ -41,6 +47,7 @@ root_agent = Agent(
     tools=[
         start_journey,
         continue_journey,
+        check_approval_authorization,
         approve_journey,
         reject_journey,
         get_journey_status,

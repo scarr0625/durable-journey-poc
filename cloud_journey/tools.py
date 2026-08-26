@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, TypeVar
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
+from cloud_journey.authorization import (
+    AuthorizationDecision,
+    SimulatedUser,
+    evaluate_approval_authorization,
+    get_simulated_user,
+)
 from cloud_journey.database import SessionLocal, init_db
 from cloud_journey.models import JourneyEvent, JourneyOperation
 from cloud_journey.state_machine import (
@@ -27,26 +32,12 @@ AGENT_ACTOR = Actor("AGENT", "project-factory-agent")
 T = TypeVar("T")
 
 
-@dataclass(frozen=True)
-class SimulatedUser:
-    name: str
-    email: str
-    role: str
-
-
-SIMULATED_USERS: dict[str, SimulatedUser] = {
-    "sam": SimulatedUser("sam", "sam@example.com", "PROJECT_OWNER"),
-    "reviewer": SimulatedUser("reviewer", "reviewer@example.com", "REVIEWER"),
-    "developer": SimulatedUser("developer", "developer@example.com", "DEVELOPER"),
-}
-APPROVER_ROLES = frozenset({"PROJECT_OWNER", "REVIEWER"})
-
-
 class AuthorizationDenied(JourneyError):
-    def __init__(self, user_name: str, role: str):
-        super().__init__(f"Authorization denied: {user_name} ({role}) cannot approve or reject")
-        self.user_name = user_name
-        self.role = role
+    def __init__(self, decision: AuthorizationDecision):
+        super().__init__(f"Authorization denied: {decision.reason}")
+        self.user_name = decision.user_name
+        self.role = decision.role
+        self.decision = decision
 
 
 class UnknownUser(JourneyError):
@@ -76,11 +67,60 @@ class JourneyService:
 
     @staticmethod
     def _user(user_name: str) -> SimulatedUser:
-        normalized = user_name.strip().lower()
-        try:
-            return SIMULATED_USERS[normalized]
-        except KeyError as exc:
-            raise UnknownUser(user_name) from exc
+        user = get_simulated_user(user_name)
+        if user is None:
+            raise UnknownUser(user_name)
+        return user
+
+    def check_approval_authorization(
+        self, journey_id: str, user_name: str, action: str
+    ) -> dict[str, Any]:
+        """Return an explainable decision without changing Journey state."""
+        user = self._user(user_name)
+        journey = self.state_machine.get_journey(journey_id)
+        decision = evaluate_approval_authorization(
+            user=user,
+            action=action,
+            requested_by=journey.requested_by,
+        )
+        return {
+            "ok": True,
+            "journey_id": journey_id,
+            "current_state": journey.status,
+            "requested_by": journey.requested_by,
+            "user_name": decision.user_name,
+            "role": decision.role,
+            "groups": sorted(decision.groups),
+            "action": decision.action,
+            "authorized": decision.allowed,
+            "required_group": decision.required_group,
+            "reason": decision.reason,
+        }
+
+    def _require_approval_authorization(
+        self, journey_id: str, user: SimulatedUser, action: str
+    ) -> AuthorizationDecision:
+        journey = self.state_machine.get_journey(journey_id)
+        decision = evaluate_approval_authorization(
+            user=user,
+            action=action,
+            requested_by=journey.requested_by,
+        )
+        if not decision.allowed:
+            self.state_machine.record_event(
+                journey_id,
+                event_type="AUTHORIZATION_DENIED",
+                actor=Actor("USER", user.name),
+                message=decision.reason,
+                metadata={
+                    "role": user.role,
+                    "groups": sorted(user.groups),
+                    "required_group": decision.required_group,
+                    "action": decision.action,
+                },
+            )
+            raise AuthorizationDenied(decision)
+        return decision
 
     def _start_operation(self, journey_id: str, operation_type: str) -> str:
         operation_id = f"O-{uuid.uuid4().hex.upper()}"
@@ -204,15 +244,9 @@ class JourneyService:
         user = self._user(user_name)
 
         def action() -> list[TransitionResult]:
-            if user.role not in APPROVER_ROLES:
-                self.state_machine.record_event(
-                    journey_id,
-                    event_type="AUTHORIZATION_DENIED",
-                    actor=Actor("USER", user.name),
-                    message=f"Approval denied for role {user.role}",
-                    metadata={"role": user.role, "action": "approve"},
-                )
-                raise AuthorizationDenied(user.name, user.role)
+            decision = self._require_approval_authorization(
+                journey_id, user, "approve"
+            )
 
             transitions: list[TransitionResult] = []
             current = JourneyState(self.state_machine.get_journey(journey_id).status)
@@ -223,7 +257,11 @@ class JourneyService:
                         JourneyState.APPROVED,
                         actor=Actor("USER", user.name),
                         message=f"Journey approved by {user.name}",
-                        metadata={"role": user.role},
+                        metadata={
+                            "role": user.role,
+                            "groups": sorted(user.groups),
+                            "authorization_basis": decision.required_group,
+                        },
                     )
                 )
             pipeline = {
@@ -259,22 +297,21 @@ class JourneyService:
             raise ValueError("A rejection reason is required")
 
         def action() -> list[TransitionResult]:
-            if user.role not in APPROVER_ROLES:
-                self.state_machine.record_event(
-                    journey_id,
-                    event_type="AUTHORIZATION_DENIED",
-                    actor=Actor("USER", user.name),
-                    message=f"Rejection denied for role {user.role}",
-                    metadata={"role": user.role, "action": "reject"},
-                )
-                raise AuthorizationDenied(user.name, user.role)
+            decision = self._require_approval_authorization(
+                journey_id, user, "reject"
+            )
             return [
                 self.state_machine.transition(
                     journey_id,
                     JourneyState.REJECTED,
                     actor=Actor("USER", user.name),
                     message=reason,
-                    metadata={"role": user.role, "rejection_reason": reason},
+                    metadata={
+                        "role": user.role,
+                        "groups": sorted(user.groups),
+                        "authorization_basis": decision.required_group,
+                        "rejection_reason": reason,
+                    },
                 )
             ]
 
@@ -390,3 +427,14 @@ def reject_journey(journey_id: str, user_name: str, reason: str) -> dict[str, An
 def get_journey_status(journey_id: str) -> dict[str, Any]:
     """Read the authoritative Journey state and complete audit history from the database."""
     return _tool_call(lambda: get_service().status(journey_id))
+
+
+def check_approval_authorization(
+    journey_id: str, user_name: str, action: str
+) -> dict[str, Any]:
+    """Check whether a simulated user may approve or reject a Journey and explain why."""
+    return _tool_call(
+        lambda: get_service().check_approval_authorization(
+            journey_id, user_name, action
+        )
+    )

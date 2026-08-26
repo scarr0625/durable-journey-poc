@@ -11,7 +11,7 @@ def test_concurrent_approval_and_rejection_only_one_succeeds(service) -> None:
 
     def approve() -> str:
         try:
-            service.approve(journey_id, "sam")
+            service.approve(journey_id, "reviewer")
             return "approved"
         except (InvalidTransition, ConcurrentTransition):
             return "conflict"

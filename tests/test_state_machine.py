@@ -23,7 +23,7 @@ def test_normal_journey_stops_for_approval_then_completes(service) -> None:
     assert waiting["current_state"] == "WAITING_FOR_APPROVAL"
     assert waiting["version"] == 7
 
-    completed = service.approve(journey_id, "sam")
+    completed = service.approve(journey_id, "reviewer")
     assert completed["current_state"] == "COMPLETED"
     assert completed["version"] == 11
     assert completed["state_path"][-4:] == [

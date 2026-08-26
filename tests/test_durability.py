@@ -30,7 +30,7 @@ def test_state_survives_engine_and_service_restart(engine, service) -> None:
 def test_full_audit_history_distinguishes_user_and_agent(service) -> None:
     journey_id = service.start("400500", "sam")["journey_id"]
     service.continue_journey(journey_id)
-    result = service.approve(journey_id, "sam")
+    result = service.approve(journey_id, "reviewer")
 
     assert result["state_path"] == [
         "CREATED",
@@ -51,7 +51,7 @@ def test_full_audit_history_distinguishes_user_and_agent(service) -> None:
     provisioning = next(
         event for event in result["history"] if event["to_state"] == "PROVISIONING"
     )
-    assert (approval["actor_type"], approval["actor_id"]) == ("USER", "sam")
+    assert (approval["actor_type"], approval["actor_id"]) == ("USER", "reviewer")
     assert (provisioning["actor_type"], provisioning["actor_id"]) == (
         "AGENT",
         "project-factory-agent",
