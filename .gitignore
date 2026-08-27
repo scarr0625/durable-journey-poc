@@ -1,4 +1,5 @@
 .env
+.env.gcp
 .venv/
 __pycache__/
 .pytest_cache/

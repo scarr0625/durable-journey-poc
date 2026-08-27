@@ -18,6 +18,9 @@ table.
 
 No real cloud resources are provisioned and no OAuth tokens are stored.
 
+For a fully managed GCP deployment using Agent Runtime, Agent Registry Playground,
+and the existing Cloud SQL database, follow [GCP_DEPLOYMENT.md](GCP_DEPLOYMENT.md).
+
 ## Prerequisites
 
 - Python 3.11 or newer
