@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from cloud_journey.models import Journey, JourneyEvent
@@ -90,6 +91,19 @@ class ConcurrentTransition(JourneyError):
     pass
 
 
+class DuplicateApmId(JourneyError):
+    def __init__(self, apm_id: str):
+        super().__init__("Unable to create a Journey for the requested APM ID")
+        self.apm_id = apm_id
+
+
+class JourneyUnavailable(JourneyError):
+    """Non-disclosing response for missing or inaccessible Journey data."""
+
+    def __init__(self):
+        super().__init__("No accessible Journey was found for the supplied identifier")
+
+
 @dataclass(frozen=True)
 class Actor:
     actor_type: str
@@ -121,6 +135,7 @@ class StateMachine:
         requested_by: str,
         requested_by_email: str,
         role: str,
+        owner_subject: str | None = None,
         context: dict[str, Any] | None = None,
         journey_id: str | None = None,
     ) -> Journey:
@@ -132,23 +147,27 @@ class StateMachine:
             version=1,
             requested_by=requested_by,
             requested_by_email=requested_by_email,
+            owner_subject=owner_subject or requested_by,
             role=role,
             context=context or {},
         )
-        with self._session_factory.begin() as session:
-            session.add(journey)
-            session.add(
-                JourneyEvent(
-                    journey_id=journey.id,
-                    event_type="JOURNEY_CREATED",
-                    from_state=None,
-                    to_state=JourneyState.CREATED.value,
-                    actor_type="USER",
-                    actor_id=requested_by,
-                    message=f"Journey created for APM {apm_id}",
-                    event_metadata={},
+        try:
+            with self._session_factory.begin() as session:
+                session.add(journey)
+                session.add(
+                    JourneyEvent(
+                        journey_id=journey.id,
+                        event_type="JOURNEY_CREATED",
+                        from_state=None,
+                        to_state=JourneyState.CREATED.value,
+                        actor_type="USER",
+                        actor_id=requested_by,
+                        message=f"Journey created for APM {apm_id}",
+                        event_metadata={},
+                    )
                 )
-            )
+        except IntegrityError as exc:
+            raise DuplicateApmId(apm_id) from exc
         return journey
 
     def transition(
@@ -281,6 +300,45 @@ class StateMachine:
             journey = session.get(Journey, journey_id)
             if journey is None:
                 raise JourneyNotFound(journey_id)
+            session.expunge(journey)
+            return journey
+
+    def find_journey_by_apm_id(self, apm_id: str) -> Journey | None:
+        """Internal unscoped lookup; callers must apply ownership before returning it."""
+        with self._session_factory() as session:
+            journey = session.scalar(select(Journey).where(Journey.apm_id == apm_id))
+            if journey is not None:
+                session.expunge(journey)
+            return journey
+
+    def get_owned_journey(
+        self, journey_id: str, owner_subject: str
+    ) -> Journey:
+        """Return an owned Journey without revealing whether another owner's exists."""
+        with self._session_factory() as session:
+            journey = session.scalar(
+                select(Journey).where(
+                    Journey.id == journey_id,
+                    Journey.owner_subject == owner_subject,
+                )
+            )
+            if journey is None:
+                raise JourneyUnavailable()
+            session.expunge(journey)
+            return journey
+
+    def get_owned_journey_by_apm_id(
+        self, apm_id: str, owner_subject: str
+    ) -> Journey:
+        with self._session_factory() as session:
+            journey = session.scalar(
+                select(Journey).where(
+                    Journey.apm_id == apm_id,
+                    Journey.owner_subject == owner_subject,
+                )
+            )
+            if journey is None:
+                raise JourneyUnavailable()
             session.expunge(journey)
             return journey
 

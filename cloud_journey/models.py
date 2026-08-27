@@ -5,7 +5,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -19,6 +28,7 @@ class Base(DeclarativeBase):
 
 class Journey(Base):
     __tablename__ = "journeys"
+    __table_args__ = (UniqueConstraint("apm_id", name="uq_journeys_apm_id"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     apm_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -27,6 +37,7 @@ class Journey(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
     requested_by_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    owner_subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     context: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

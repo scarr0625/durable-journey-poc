@@ -10,6 +10,7 @@ from cloud_journey.tools import (
     generate_cloud_plan,
     get_cloud_journey_guidance,
     get_journey_status,
+    get_journey_status_by_apm_id,
     record_application_inventory,
     resume_journey_after_approval,
     start_journey,
@@ -32,6 +33,11 @@ Rules:
 - Call a tool for every request to start, record inventory, generate a plan,
   wait for a decision, resume, show status, or show history. Never infer or invent
   Journey state.
+- Treat APM IDs as globally unique. When a user asks for status by APM ID,
+  call get_journey_status_by_apm_id. ToolContext supplies the runtime user ID;
+  never ask the user to provide or override the owner identity.
+- Journey details are owner-private. If a lookup returns not found or inaccessible,
+  do not confirm that the APM ID exists and do not suggest another owner's details.
 - Cloud Compass cannot approve or reject a Journey. Those decisions belong to an
   external approval backend and are written directly to PostgreSQL. If asked to
   approve in chat, explain this boundary; never claim or attempt approval.
@@ -64,5 +70,6 @@ root_agent = Agent(
         wait_for_external_approval,
         resume_journey_after_approval,
         get_journey_status,
+        get_journey_status_by_apm_id,
     ],
 )

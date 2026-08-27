@@ -13,7 +13,9 @@ table.
 - Resumable simulated inventory, planning, provisioning, and validation stages
 - Segregated approval boundary based on `CLOUD_JOURNEY_APPROVERS` membership
 - `journey_operations` records for command outcomes and future idempotency/retry work
-- Seven purpose-specific Google ADK tools and a `root_agent` suitable for ADK Web
+- Globally unique APM IDs enforced by the database
+- Owner-private Journey access bound to ADK's runtime `user_id`, across chat sessions
+- Eight purpose-specific Google ADK tools and a `root_agent` suitable for ADK Web
 - Self-contained unit/acceptance tests, including process restart and conflicting actions
 
 No real cloud resources are provisioned and no OAuth tokens are stored.
@@ -62,6 +64,36 @@ configuration defaults to PostgreSQL, and the same transition code executes
 `SELECT ... FOR UPDATE`; the optimistic version predicate adds protection on
 backends that do not implement row locks.
 
+## APM identity and privacy boundary
+
+An APM ID identifies one Journey globally, not one Journey per chat session. The
+database has a unique constraint on `journeys.apm_id`, so two simultaneous agent
+requests cannot create separate Journeys for `100200`.
+
+The owner is stored separately in `journeys.owner_subject`. ADK injects the
+runtime `ToolContext.user_id` into each tool call; it is not accepted from the
+prompt and is not exposed as a model-selectable tool argument. Every
+Journey-reading or Journey-changing ADK tool verifies this value before returning
+data. The friendly `user_name` used by this PoC (`sam`, `reviewer`, or
+`developer`) is demo business data, not the authorization identity.
+
+This gives the intended behavior:
+
+- The same owner can close the browser, open a new session later, and recover the
+  Journey with its APM ID.
+- Starting the same APM ID again as the same owner returns the existing durable
+  Journey instead of creating another row.
+- Another runtime user receives the same generic not-found response for an
+  inaccessible APM ID as for an APM ID that does not exist. No Journey ID,
+  requester, status, history, or plan is returned.
+- A different owner cannot create the same APM ID; the database remains the final
+  guard even during concurrent requests.
+
+For an existing database, run
+[`migrations/001_apm_uniqueness_and_ownership.sql`](migrations/001_apm_uniqueness_and_ownership.sql)
+before starting this version. `create_all()` cannot add the new column or unique
+index to an existing table.
+
 ## Approval boundary
 
 Cloud Compass has no approve or reject control. It creates knowledge and plans,
@@ -72,9 +104,9 @@ The local simulator models that backend with these identities:
 
 | User | Business role | Simulated AD groups | Cloud Compass access | Approval-backend access |
 |---|---|---|---|---|
-| `sam` | `PROJECT_OWNER` | none | Requester | None |
-| `reviewer` | `REVIEWER` | `CLOUD_JOURNEY_APPROVERS` | Status only | Approve/reject others' requests |
-| `developer` | `DEVELOPER` | none | Knowledge/status | None |
+| `sam` | `PROJECT_OWNER` | none | Own Journeys only | None |
+| `reviewer` | `REVIEWER` | `CLOUD_JOURNEY_APPROVERS` | General knowledge only | Approve/reject others' requests |
+| `developer` | `DEVELOPER` | none | General knowledge only | None |
 
 Cloud Compass can only poll the database and observe the backend decision. It can
 resume provisioning after it reads `APPROVED`; it cannot create that state. The
@@ -85,13 +117,14 @@ event/callback or durable workflow timer rather than keeping an ADK request open
 
 | Tool | Purpose | Changes Journey state |
 |---|---|---:|
-| `start_journey(apm_id, user_name)` | Create the durable Journey and simulate APM validation | Yes |
+| `start_journey(apm_id, user_name)` | Create a globally unique Journey for the runtime owner, or return that owner's existing Journey | Yes on first call |
 | `get_cloud_journey_guidance(question, journey_id)` | Answer using persisted Journey context and identify missing discovery facts | No |
 | `record_application_inventory(...)` | Persist application, platform, dependency, data, and availability knowledge | Yes |
 | `generate_cloud_plan(...)` | Persist a proposed target plan and submit it for independent review | Yes |
 | `wait_for_external_approval(journey_id, timeout_seconds, poll_interval_seconds)` | Poll PostgreSQL for an external decision for up to two minutes | No |
 | `resume_journey_after_approval(journey_id)` | Continue simulated execution only if PostgreSQL already says `APPROVED` | Yes |
 | `get_journey_status(journey_id)` | Read current state, version, requester, and complete audit history | No |
+| `get_journey_status_by_apm_id(apm_id)` | Recover the current runtime owner's Journey in a new chat session | No |
 
 Neither approval nor rejection is registered as an ADK tool. The backend-only
 simulator is a separate module, `cloud_journey.approval_backend`. All state changes
@@ -210,7 +243,7 @@ Wait up to two minutes for the external decision and show the current status.
 
 Expected final state: `REJECTED`. Cloud Compass observes it and does not resume.
 
-### Demo 3: restart proves durable recovery
+### Demo 3: new-session recovery by APM ID and owner isolation
 
 ```text
 Start a Cloud Journey for APM 300400 as sam.
@@ -223,18 +256,47 @@ Create a proposed plan targeting Cloud Run with Cloud SQL. The objective is to
 reduce operations effort. Constraints are private database access and a phased cutover.
 ```
 
-Record the returned ID, stop ADK Web, restart it, open a new conversation, then
-send:
+Stop ADK Web or close the browser. Later, open a completely new conversation as
+the same runtime user and send the following natural message. The new chat has no
+Journey ID and no previous conversation state:
 
 ```text
-Show status for journey J-XXXXXXXX.
+Could you give me the current status of APM ID 300400?
+```
 
-Wait up to two minutes for an external approval of journey J-XXXXXXXX. If it is
+Expected response: Cloud Compass calls `get_journey_status_by_apm_id`, finds the
+row owned by the injected runtime user, and reports `WAITING_FOR_APPROVAL` with
+the Journey ID, captured plan, and durable history.
+
+Now repeat the question from a different runtime user:
+
+```text
+Could you give me the current status of APM ID 300400?
+```
+
+Expected response:
+
+```text
+I could not find a Journey you can access for that APM ID.
+```
+
+It must not confirm that `300400` exists or reveal its Journey ID, owner, state,
+plan, or history. Finally, return as the original owner and send:
+
+```text
+Start a Cloud Journey for APM 300400 as sam.
+```
+
+Cloud Compass returns the existing Journey with `created=false`; it does not
+create a duplicate. To finish the original workflow, ask:
+
+```text
+Wait up to two minutes for an external approval of APM ID 300400. If it is
 approved, resume execution.
 ```
 
-The first response after restart must load `WAITING_FOR_APPROVAL` from PostgreSQL.
-Run the backend simulator in another terminal; Cloud Compass then detects its
+The agent first resolves the owner's Journey by APM ID. Run the backend simulator
+with the returned Journey ID in another terminal. Cloud Compass then detects the
 database update and resumes without any approval action in the chat UI.
 
 ## Data and transaction behavior

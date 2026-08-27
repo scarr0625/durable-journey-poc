@@ -16,7 +16,7 @@ Agent Runtime (ADK AdkApp + managed chat sessions)
           v
 Existing Cloud SQL PostgreSQL
           |
-          +-- journeys
+          +-- journeys (unique apm_id + owner_subject)
           +-- journey_events
           +-- journey_operations
 ```
@@ -24,6 +24,44 @@ Existing Cloud SQL PostgreSQL
 ADK's managed session resource stores conversation history. It does not replace
 the Journey tables: every status tool still reads the authoritative business
 state from Cloud SQL.
+
+## Required: migrate the existing database
+
+This revision adds `journeys.owner_subject` and a database-enforced unique APM
+ID. SQLAlchemy's `create_all()` creates these fields for a fresh database but
+does not alter an existing Cloud SQL table.
+
+With the Cloud SQL Auth Proxy already running, first check for existing
+duplicates:
+
+```sql
+SELECT apm_id, COUNT(*)
+FROM journeys
+GROUP BY apm_id
+HAVING COUNT(*) > 1;
+```
+
+Resolve any returned rows deliberately; do not arbitrarily delete Journey audit
+records. Then apply the migration through the proxy:
+
+```powershell
+psql "host=127.0.0.1 port=5432 dbname=durable_journey user=journey sslmode=disable" -v ON_ERROR_STOP=1 -f migrations/001_apm_uniqueness_and_ownership.sql
+```
+
+The migration backfills legacy `owner_subject` values from the PoC's
+`requested_by` value, for example `sam`. That preserves local behavior. Before
+using old rows in Agent Runtime, map each legacy owner to the stable runtime user
+ID that will own those rows:
+
+```sql
+UPDATE journeys
+SET owner_subject = 'STABLE_RUNTIME_USER_ID'
+WHERE owner_subject = 'sam';
+```
+
+Do this only from an administrator-controlled migration process. Never accept an
+owner subject from a chat prompt. New Journeys bind it automatically from ADK's
+injected `ToolContext.user_id`.
 
 ## 1. Choose the Cloud SQL network path
 
@@ -186,14 +224,36 @@ In Google Cloud console:
 The equivalent route is **Agent Platform > Deployments > Durable Cloud Compass >
 Playground**.
 
-Start with a read-only database proof using a Journey ID created locally:
+Start with a read-only database proof using an APM ID whose `owner_subject`
+matches the Playground runtime user:
 
 ```text
-Show the status and full history for journey J-XXXXXXXX.
+Could you give me the current status of APM ID 100200?
 ```
 
 If that succeeds, Agent Runtime is reading the same Cloud SQL database as the
 local Auth Proxy configuration. Then start a new Journey in the Playground.
+
+### Identity boundary for the PoC
+
+Every tool reads `ToolContext.user_id`, which ADK injects outside the model's tool
+arguments. A name typed in chat, including "as sam", cannot change the stored
+owner. A new session with the same runtime `user_id` can recover the Journey;
+another `user_id` receives a generic inaccessible/not-found response.
+
+The Agent Runtime API lets a calling client supply `user_id`. Therefore, treat a
+direct API caller as a trusted frontend and do not let an untrusted client choose
+an arbitrary user ID. Also verify with two authorized testers that your current
+Playground release supplies distinct, stable IDs before presenting it as user
+isolation; the Playground documentation does not promise that its `user_id` is
+the signed-in user's email.
+
+For production end-user access, put the runtime behind a trusted authenticated
+frontend or register it with a Gemini Enterprise app and bind ownership to its
+verified user identity. Google documents that registered ADK agents receive the
+user's email from Gemini Enterprise. Agent Runtime's service account or Agent
+Identity is the agent workload identity and must not be reused as the human owner
+identity.
 
 ## 9. Optional SDK smoke test
 
@@ -203,13 +263,43 @@ After setting `AGENT_RESOURCE_NAME`:
 python scripts/query_remote_agent.py
 ```
 
+The SDK caller explicitly supplies `AGENT_TEST_USER`. Use the same value in a
+later invocation to model the same owner in a new session, and a different value
+to test denial without relying on the Playground's identity behavior:
+
+```powershell
+$env:AGENT_TEST_USER = "project-owner-a"
+$env:AGENT_TEST_MESSAGE = "Could you give me the current status of APM ID 100200?"
+python scripts/query_remote_agent.py
+
+$env:AGENT_TEST_USER = "different-user-b"
+python scripts/query_remote_agent.py
+```
+
 ## 10. Verify durability in GCP
 
-1. Create a Journey in the managed Playground.
+1. As runtime user A, create APM `100200` in the managed Playground.
 2. Capture inventory and generate the plan until `WAITING_FOR_APPROVAL`.
 3. Close the Playground session and create a new one.
-4. Ask for status using the Journey ID.
-5. Confirm that Cloud Compass reloads the Journey from Cloud SQL.
+4. As the same runtime user A, ask: `Could you give me the current status of APM
+   ID 100200?`
+5. Confirm that Cloud Compass reloads `WAITING_FOR_APPROVAL` from Cloud SQL.
+6. Start another new session as runtime user B and ask the same question.
+7. Confirm that user B receives only the generic inaccessible/not-found response
+   and sees no APM, Journey, owner, status, plan, or history data.
+8. As user B, try to start APM `100200`; confirm creation fails generically and no
+   second database row appears.
+
+Verify the database invariant directly:
+
+```sql
+SELECT apm_id, COUNT(*)
+FROM journeys
+WHERE apm_id = '100200'
+GROUP BY apm_id;
+```
+
+The result must be exactly one row with count `1`.
 
 Agent Runtime sessions may preserve conversation history, but this test uses a new
 session deliberately. PostgreSQL—not the managed chat session—must recover the

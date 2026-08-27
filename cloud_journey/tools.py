@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Callable, TypeVar
 
+from google.adk.tools import ToolContext
 from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -22,9 +23,11 @@ from cloud_journey.models import JourneyEvent, JourneyOperation
 from cloud_journey.state_machine import (
     Actor,
     ConcurrentTransition,
+    DuplicateApmId,
     InvalidTransition,
     JourneyError,
     JourneyState,
+    JourneyUnavailable,
     StateMachine,
     TransitionResult,
 )
@@ -45,6 +48,11 @@ class UnknownUser(JourneyError):
     def __init__(self, user_name: str):
         super().__init__(f"Unknown simulated user: {user_name}")
         self.user_name = user_name
+
+
+class ProjectOwnerRequired(JourneyError):
+    def __init__(self):
+        super().__init__("Only a project owner can start an APM Journey")
 
 
 def _iso(value: datetime) -> str:
@@ -173,18 +181,52 @@ class JourneyService:
         )
         return result
 
-    def start(self, apm_id: str, user_name: str) -> dict[str, Any]:
+    def require_owner(self, journey_id: str, owner_subject: str) -> None:
+        self.state_machine.get_owned_journey(journey_id, owner_subject)
+
+    def start(
+        self, apm_id: str, user_name: str, owner_subject: str | None = None
+    ) -> dict[str, Any]:
         apm_id = apm_id.strip()
         if not apm_id:
             raise ValueError("apm_id must not be empty")
         user = self._user(user_name)
-        journey = self.state_machine.create_journey(
-            apm_id=apm_id,
-            requested_by=user.name,
-            requested_by_email=user.email,
-            role=user.role,
-            context={"apm_validation": "simulated"},
-        )
+        if user.role != "PROJECT_OWNER":
+            raise ProjectOwnerRequired()
+        subject = (owner_subject or user.name).strip()
+        if not subject:
+            raise ValueError("owner subject must not be empty")
+
+        existing = self.state_machine.find_journey_by_apm_id(apm_id)
+        if existing is not None:
+            if existing.owner_subject != subject:
+                raise DuplicateApmId(apm_id)
+            response = self._response(existing.id, [])
+            response.update(
+                {
+                    "created": False,
+                    "note": "This APM ID already has a Journey owned by the current user; returning its durable status.",
+                }
+            )
+            return response
+
+        try:
+            journey = self.state_machine.create_journey(
+                apm_id=apm_id,
+                requested_by=user.name,
+                requested_by_email=user.email,
+                role=user.role,
+                owner_subject=subject,
+                context={"apm_validation": "simulated"},
+            )
+        except DuplicateApmId:
+            # Handles a concurrent create race without disclosing another owner.
+            existing = self.state_machine.find_journey_by_apm_id(apm_id)
+            if existing is not None and existing.owner_subject == subject:
+                response = self._response(existing.id, [])
+                response.update({"created": False, "note": "The APM Journey already exists."})
+                return response
+            raise
 
         def action() -> list[TransitionResult]:
             return [
@@ -204,7 +246,9 @@ class JourneyService:
             ]
 
         transitions = self._run_operation(journey.id, "START_JOURNEY", action)
-        return self._response(journey.id, transitions)
+        response = self._response(journey.id, transitions)
+        response["created"] = True
+        return response
 
     def continue_journey(self, journey_id: str) -> dict[str, Any]:
         """Compatibility shortcut; the conversational agent uses explicit steps."""
@@ -696,6 +740,19 @@ class JourneyService:
     def status(self, journey_id: str) -> dict[str, Any]:
         return self._response(journey_id, [])
 
+    def status_by_apm_id(
+        self, apm_id: str, owner_subject: str
+    ) -> dict[str, Any]:
+        apm_id = apm_id.strip()
+        if not apm_id:
+            raise ValueError("apm_id must not be empty")
+        journey = self.state_machine.get_owned_journey_by_apm_id(
+            apm_id, owner_subject
+        )
+        response = self._response(journey.id, [])
+        response["lookup"] = "apm_id"
+        return response
+
     def _response(
         self,
         journey_id: str,
@@ -774,15 +831,23 @@ def _tool_call(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         }
     except ConcurrentTransition as exc:
         return {"ok": False, "status_code": 409, "error": "ConcurrentTransition", "message": str(exc)}
+    except DuplicateApmId as exc:
+        return {"ok": False, "status_code": 409, "error": "ApmIdUnavailable", "message": str(exc)}
+    except ProjectOwnerRequired as exc:
+        return {"ok": False, "status_code": 403, "error": "ProjectOwnerRequired", "message": str(exc)}
     except JourneyError as exc:
         return {"ok": False, "status_code": 404, "error": type(exc).__name__, "message": str(exc)}
     except ValueError as exc:
         return {"ok": False, "status_code": 400, "error": "InvalidInput", "message": str(exc)}
 
 
-def start_journey(apm_id: str, user_name: str) -> dict[str, Any]:
+def start_journey(
+    apm_id: str, user_name: str, tool_context: ToolContext
+) -> dict[str, Any]:
     """Start a Cloud Journey for an APM ID as a simulated user."""
-    return _tool_call(lambda: get_service().start(apm_id, user_name))
+    return _tool_call(
+        lambda: get_service().start(apm_id, user_name, tool_context.user_id)
+    )
 
 
 def continue_journey(journey_id: str) -> dict[str, Any]:
@@ -791,10 +856,16 @@ def continue_journey(journey_id: str) -> dict[str, Any]:
 
 
 def get_cloud_journey_guidance(
-    question: str, journey_id: str = ""
+    question: str, tool_context: ToolContext, journey_id: str = ""
 ) -> dict[str, Any]:
     """Answer a discovery question and explain what information the Journey needs next."""
-    return _tool_call(lambda: get_service().guidance(question, journey_id))
+    def call() -> dict[str, Any]:
+        service = get_service()
+        if journey_id.strip():
+            service.require_owner(journey_id, tool_context.user_id)
+        return service.guidance(question, journey_id)
+
+    return _tool_call(call)
 
 
 def record_application_inventory(
@@ -806,10 +877,13 @@ def record_application_inventory(
     dependencies: str,
     data_classification: str,
     availability_requirement: str,
+    tool_context: ToolContext,
 ) -> dict[str, Any]:
     """Record application discovery facts supplied by the owner in durable storage."""
-    return _tool_call(
-        lambda: get_service().record_inventory(
+    def call() -> dict[str, Any]:
+        service = get_service()
+        service.require_owner(journey_id, tool_context.user_id)
+        return service.record_inventory(
             journey_id,
             application_name,
             business_criticality,
@@ -819,7 +893,8 @@ def record_application_inventory(
             data_classification,
             availability_requirement,
         )
-    )
+
+    return _tool_call(call)
 
 
 def generate_cloud_plan(
@@ -827,33 +902,64 @@ def generate_cloud_plan(
     target_platform: str,
     migration_objectives: str,
     constraints: str,
+    tool_context: ToolContext,
 ) -> dict[str, Any]:
     """Generate a simulated Cloud plan from captured knowledge and submit it for review."""
-    return _tool_call(
-        lambda: get_service().generate_plan(
+    def call() -> dict[str, Any]:
+        service = get_service()
+        service.require_owner(journey_id, tool_context.user_id)
+        return service.generate_plan(
             journey_id, target_platform, migration_objectives, constraints
         )
-    )
+
+    return _tool_call(call)
 
 
-def get_journey_status(journey_id: str) -> dict[str, Any]:
+def get_journey_status(
+    journey_id: str, tool_context: ToolContext
+) -> dict[str, Any]:
     """Read the authoritative Journey state and complete audit history from the database."""
-    return _tool_call(lambda: get_service().status(journey_id))
+    def call() -> dict[str, Any]:
+        service = get_service()
+        service.require_owner(journey_id, tool_context.user_id)
+        return service.status(journey_id)
+
+    return _tool_call(call)
+
+
+def get_journey_status_by_apm_id(
+    apm_id: str, tool_context: ToolContext
+) -> dict[str, Any]:
+    """Recover the current user's durable Journey by its globally unique APM ID."""
+    return _tool_call(
+        lambda: get_service().status_by_apm_id(apm_id, tool_context.user_id)
+    )
 
 
 def wait_for_external_approval(
     journey_id: str,
+    tool_context: ToolContext,
     timeout_seconds: int = 120,
     poll_interval_seconds: int = 2,
 ) -> dict[str, Any]:
     """Wait briefly for an external backend to write APPROVED or REJECTED to PostgreSQL."""
-    return _tool_call(
-        lambda: get_service().wait_for_approval(
+    def call() -> dict[str, Any]:
+        service = get_service()
+        service.require_owner(journey_id, tool_context.user_id)
+        return service.wait_for_approval(
             journey_id, timeout_seconds, poll_interval_seconds
         )
-    )
+
+    return _tool_call(call)
 
 
-def resume_journey_after_approval(journey_id: str) -> dict[str, Any]:
+def resume_journey_after_approval(
+    journey_id: str, tool_context: ToolContext
+) -> dict[str, Any]:
     """Resume simulated execution only when PostgreSQL already contains APPROVED."""
-    return _tool_call(lambda: get_service().resume_after_approval(journey_id))
+    def call() -> dict[str, Any]:
+        service = get_service()
+        service.require_owner(journey_id, tool_context.user_id)
+        return service.resume_after_approval(journey_id)
+
+    return _tool_call(call)
