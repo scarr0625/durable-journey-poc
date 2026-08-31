@@ -7,7 +7,7 @@ from cloud_journey.tools import JourneyService
 
 
 def test_state_survives_engine_and_service_restart(engine, service) -> None:
-    journey_id = service.start("300400", "sam")["journey_id"]
+    journey_id = service.start("100401", "sam")["journey_id"]
     service.continue_journey(journey_id)
     database_url = engine.url.render_as_string(hide_password=False)
 
@@ -28,7 +28,7 @@ def test_state_survives_engine_and_service_restart(engine, service) -> None:
 
 
 def test_full_audit_history_distinguishes_user_and_agent(service) -> None:
-    journey_id = service.start("400500", "sam")["journey_id"]
+    journey_id = service.start("100401", "sam")["journey_id"]
     service.continue_journey(journey_id)
     service.record_external_approval(journey_id, "reviewer")
     result = service.resume_after_approval(journey_id)

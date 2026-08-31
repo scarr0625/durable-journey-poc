@@ -9,7 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 APPROVAL_GROUP = "CLOUD_JOURNEY_APPROVERS"
+APM_GROUP_1 = "GROUP_1"
+APM_GROUP_2 = "GROUP_2"
 SUPPORTED_APPROVAL_ACTIONS = frozenset({"approve", "reject"})
+
+# Demo data for the unauthenticated PoC. The database table remains the source
+# of truth for APM-to-group access; these rows only bootstrap a fresh database.
+DEFAULT_APM_GROUP_ACCESS: dict[str, frozenset[str]] = {
+    APM_GROUP_1: frozenset({"100401", "100402"}),
+    APM_GROUP_2: frozenset({"100403", "100404"}),
+}
 
 
 @dataclass(frozen=True)
@@ -18,6 +27,7 @@ class SimulatedUser:
     email: str
     role: str
     groups: frozenset[str] = frozenset()
+    apm_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -31,9 +41,52 @@ class AuthorizationDecision:
     reason: str
 
 
+@dataclass(frozen=True)
+class ApmAuthorizationDecision:
+    allowed: bool
+    apm_id: str
+    user_name: str
+    user_group: str | None
+    reason: str
+
+
 SIMULATED_USERS: dict[str, SimulatedUser] = {
-    # The requester/owner deliberately does not belong to the approval group.
-    "sam": SimulatedUser("sam", "sam@example.com", "PROJECT_OWNER"),
+    # These identities make group authorization testable before SSO is added.
+    "sam": SimulatedUser(
+        "sam",
+        "sam@example.com",
+        "PROJECT_OWNER",
+        frozenset({APM_GROUP_1}),
+        APM_GROUP_1,
+    ),
+    "ivan": SimulatedUser(
+        "ivan",
+        "ivan@example.com",
+        "PROJECT_OWNER",
+        frozenset({APM_GROUP_1}),
+        APM_GROUP_1,
+    ),
+    "adi": SimulatedUser(
+        "adi",
+        "adi@example.com",
+        "PROJECT_OWNER",
+        frozenset({APM_GROUP_1}),
+        APM_GROUP_1,
+    ),
+    "abdur": SimulatedUser(
+        "abdur",
+        "abdur@example.com",
+        "PROJECT_OWNER",
+        frozenset({APM_GROUP_2}),
+        APM_GROUP_2,
+    ),
+    "ajir": SimulatedUser(
+        "ajir",
+        "ajir@example.com",
+        "PROJECT_OWNER",
+        frozenset({APM_GROUP_2}),
+        APM_GROUP_2,
+    ),
     "reviewer": SimulatedUser(
         "reviewer",
         "reviewer@example.com",
@@ -46,6 +99,28 @@ SIMULATED_USERS: dict[str, SimulatedUser] = {
 
 def get_simulated_user(user_name: str) -> SimulatedUser | None:
     return SIMULATED_USERS.get(user_name.strip().lower())
+
+
+def evaluate_apm_authorization(
+    *,
+    user: SimulatedUser,
+    apm_id: str,
+    required_group: str | None,
+) -> ApmAuthorizationDecision:
+    """Evaluate the database-backed APM mapping without disclosing other groups."""
+    allowed = required_group is not None and user.apm_group == required_group
+    if allowed:
+        reason = f"{user.name} may access the requested APM ID through {user.apm_group}."
+    else:
+        # Use one message for unmapped and cross-group IDs to avoid an APM oracle.
+        reason = "The simulated user is not authorized to access the requested APM ID."
+    return ApmAuthorizationDecision(
+        allowed=allowed,
+        apm_id=apm_id,
+        user_name=user.name,
+        user_group=user.apm_group,
+        reason=reason,
+    )
 
 
 def evaluate_approval_authorization(

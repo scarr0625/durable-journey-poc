@@ -6,7 +6,7 @@ from cloud_journey.tools import AuthorizationDenied
 
 
 def waiting_journey(service) -> str:
-    journey_id = service.start("200300", "sam")["journey_id"]
+    journey_id = service.start("100401", "sam")["journey_id"]
     service.record_inventory(
         journey_id,
         "Billing API",
@@ -65,7 +65,7 @@ def test_backend_policy_explains_group_decision(service) -> None:
     )
 
     assert owner["authorized"] is False
-    assert owner["groups"] == []
+    assert owner["groups"] == ["GROUP_1"]
     assert reviewer["authorized"] is True
     assert reviewer["groups"] == ["CLOUD_JOURNEY_APPROVERS"]
 

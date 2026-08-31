@@ -14,8 +14,8 @@ table.
 - Segregated approval boundary based on `CLOUD_JOURNEY_APPROVERS` membership
 - `journey_operations` records for command outcomes and future idempotency/retry work
 - Globally unique APM IDs enforced by the database
-- Owner-private Journey access bound to ADK's runtime `user_id`, across chat sessions
-- Eight purpose-specific Google ADK tools and a `root_agent` suitable for ADK Web
+- Database-backed group-to-APM authorization with session-bound simulated users
+- Nine purpose-specific Google ADK tools and a `root_agent` suitable for ADK Web
 - Self-contained unit/acceptance tests, including process restart and conflicting actions
 
 No real cloud resources are provisioned and no OAuth tokens are stored.
@@ -64,35 +64,48 @@ configuration defaults to PostgreSQL, and the same transition code executes
 `SELECT ... FOR UPDATE`; the optimistic version predicate adds protection on
 backends that do not implement row locks.
 
-## APM identity and privacy boundary
+## Simulated group authorization and privacy boundary
 
 An APM ID identifies one Journey globally, not one Journey per chat session. The
 database has a unique constraint on `journeys.apm_id`, so two simultaneous agent
-requests cannot create separate Journeys for `100200`.
+requests cannot create separate Journeys for `100401`.
 
-The owner is stored separately in `journeys.owner_subject`. ADK injects the
-runtime `ToolContext.user_id` into each tool call; it is not accepted from the
-prompt and is not exposed as a model-selectable tool argument. Every
-Journey-reading or Journey-changing ADK tool verifies this value before returning
-data. The friendly `user_name` used by this PoC (`sam`, `reviewer`, or
-`developer`) is demo business data, not the authorization identity.
+This PoC intentionally has no authentication provider. `sam`, `ivan`, `adi`,
+`abdur`, and `ajir` are simulated identities. The first identity selection or
+`start_journey` call binds one simulated identity to ADK session state; switching
+identity inside that session is rejected. This makes authorization behavior
+testable, but a user can still open a new session and claim another name, so it
+must not be treated as production security.
+
+The `apm_group_access` table is the authorization source of truth. Fresh PoC
+databases are seeded without overwriting existing rows:
+
+| Simulated group | Users | Available APM IDs |
+|---|---|---|
+| `GROUP_1` | `sam`, `ivan`, `adi` | `100401`, `100402` |
+| `GROUP_2` | `abdur`, `ajir` | `100403`, `100404` |
+
+`journeys.owner_subject` remains an audit field containing ADK's runtime
+`ToolContext.user_id`; it is no longer the Journey access boundary. Every ADK
+read or change checks the Journey's APM ID against the session user's group.
 
 This gives the intended behavior:
 
-- The same owner can close the browser, open a new session later, and recover the
-  Journey with its APM ID.
-- Starting the same APM ID again as the same owner returns the existing durable
+- A same-group member can select their simulated identity in a new session and
+  recover the Journey with its APM ID.
+- Starting the same APM ID again as a same-group member returns the existing durable
   Journey instead of creating another row.
-- Another runtime user receives the same generic not-found response for an
-  inaccessible APM ID as for an APM ID that does not exist. No Journey ID,
+- A different-group user receives the same denial for a cross-group APM ID as for
+  an unmapped APM ID. No Journey ID,
   requester, status, history, or plan is returned.
-- A different owner cannot create the same APM ID; the database remains the final
-  guard even during concurrent requests.
+- The database uniqueness constraint remains the final duplicate guard during
+  concurrent requests.
 
 For an existing database, run
-[`migrations/001_apm_uniqueness_and_ownership.sql`](migrations/001_apm_uniqueness_and_ownership.sql)
-before starting this version. `create_all()` cannot add the new column or unique
-index to an existing table.
+[`migrations/001_apm_uniqueness_and_ownership.sql`](migrations/001_apm_uniqueness_and_ownership.sql),
+then [`migrations/002_group_apm_authorization.sql`](migrations/002_group_apm_authorization.sql)
+before starting this version. If an enterprise mapping table already exists,
+adapt `ApmGroupAccess` to it instead of keeping duplicate mappings.
 
 ## Approval boundary
 
@@ -104,7 +117,8 @@ The local simulator models that backend with these identities:
 
 | User | Business role | Simulated AD groups | Cloud Compass access | Approval-backend access |
 |---|---|---|---|---|
-| `sam` | `PROJECT_OWNER` | none | Own Journeys only | None |
+| `sam`, `ivan`, `adi` | `PROJECT_OWNER` | `GROUP_1` | APMs `100401`, `100402` | None |
+| `abdur`, `ajir` | `PROJECT_OWNER` | `GROUP_2` | APMs `100403`, `100404` | None |
 | `reviewer` | `REVIEWER` | `CLOUD_JOURNEY_APPROVERS` | General knowledge only | Approve/reject others' requests |
 | `developer` | `DEVELOPER` | none | General knowledge only | None |
 
@@ -117,14 +131,15 @@ event/callback or durable workflow timer rather than keeping an ADK request open
 
 | Tool | Purpose | Changes Journey state |
 |---|---|---:|
-| `start_journey(apm_id, user_name)` | Create a globally unique Journey for the runtime owner, or return that owner's existing Journey | Yes on first call |
+| `select_simulated_identity(user_name)` | Bind a demo user to the current ADK session and show that group's APM IDs | No |
+| `start_journey(apm_id, user_name)` | Bind the demo user, authorize the APM mapping, and create or return the group's Journey | Yes on first call |
 | `get_cloud_journey_guidance(question, journey_id)` | Answer using persisted Journey context and identify missing discovery facts | No |
 | `record_application_inventory(...)` | Persist application, platform, dependency, data, and availability knowledge | Yes |
 | `generate_cloud_plan(...)` | Persist a proposed target plan and submit it for independent review | Yes |
 | `wait_for_external_approval(journey_id, timeout_seconds, poll_interval_seconds)` | Poll PostgreSQL for an external decision for up to two minutes | No |
 | `resume_journey_after_approval(journey_id)` | Continue simulated execution only if PostgreSQL already says `APPROVED` | Yes |
 | `get_journey_status(journey_id)` | Read current state, version, requester, and complete audit history | No |
-| `get_journey_status_by_apm_id(apm_id)` | Recover the current runtime owner's Journey in a new chat session | No |
+| `get_journey_status_by_apm_id(apm_id)` | Recover a Journey authorized for the simulated user's group | No |
 
 Neither approval nor rejection is registered as an ADK tool. The backend-only
 simulator is a separate module, `cloud_journey.approval_backend`. All state changes
@@ -153,7 +168,7 @@ should resolve to the prior tool result.
 ```text
 Before I start, explain what Cloud Compass can help me with during an application cloud journey.
 
-Start a Cloud Journey for APM 100200 as sam.
+Start a Cloud Journey for APM 100401 as sam.
 
 What do you need to know about this application before recommending a cloud plan?
 
@@ -216,7 +231,7 @@ WAITING_FOR_APPROVAL
 ### Demo 2: independent reviewer rejects with a persisted reason
 
 ```text
-Start a Cloud Journey for APM 200300 as sam.
+Start a Cloud Journey for APM 100402 as sam.
 
 The application is Partner Portal. It is a Tier 2 service on Windows VMs with
 development and production environments. Dependencies are SQL Server, corporate
@@ -243,10 +258,10 @@ Wait up to two minutes for the external decision and show the current status.
 
 Expected final state: `REJECTED`. Cloud Compass observes it and does not resume.
 
-### Demo 3: new-session recovery by APM ID and owner isolation
+### Demo 3: new-session recovery and group isolation
 
 ```text
-Start a Cloud Journey for APM 300400 as sam.
+Start a Cloud Journey for APM 100403 as abdur.
 
 The application is Reporting Service. It is Tier 2, runs on Linux VMs, has test
 and production environments, depends on PostgreSQL and SFTP, contains internal
@@ -256,22 +271,22 @@ Create a proposed plan targeting Cloud Run with Cloud SQL. The objective is to
 reduce operations effort. Constraints are private database access and a phased cutover.
 ```
 
-Stop ADK Web or close the browser. Later, open a completely new conversation as
-the same runtime user and send the following natural message. The new chat has no
+Stop ADK Web or close the browser. Later, open a completely new conversation and
+select another member of `GROUP_2` before asking for status. The new chat has no
 Journey ID and no previous conversation state:
 
 ```text
-Could you give me the current status of APM ID 300400?
+I am ajir. Could you give me the current status of APM ID 100403?
 ```
 
-Expected response: Cloud Compass calls `get_journey_status_by_apm_id`, finds the
-row owned by the injected runtime user, and reports `WAITING_FOR_APPROVAL` with
-the Journey ID, captured plan, and durable history.
+Expected response: Cloud Compass calls `select_simulated_identity`, then
+`get_journey_status_by_apm_id`, and reports `WAITING_FOR_APPROVAL` with the
+Journey ID, captured plan, and durable history because `ajir` is in `GROUP_2`.
 
-Now repeat the question from a different runtime user:
+Now open another new session and repeat as a `GROUP_1` member:
 
 ```text
-Could you give me the current status of APM ID 300400?
+I am sam. Could you give me the current status of APM ID 100403?
 ```
 
 Expected response:
@@ -280,22 +295,23 @@ Expected response:
 I could not find a Journey you can access for that APM ID.
 ```
 
-It must not confirm that `300400` exists or reveal its Journey ID, owner, state,
-plan, or history. Finally, return as the original owner and send:
+It must not confirm that `100403` exists or reveal its Journey ID, requester,
+state, plan, or history. Finally, open a new session as another `GROUP_2` member
+and send:
 
 ```text
-Start a Cloud Journey for APM 300400 as sam.
+Start a Cloud Journey for APM 100403 as ajir.
 ```
 
 Cloud Compass returns the existing Journey with `created=false`; it does not
 create a duplicate. To finish the original workflow, ask:
 
 ```text
-Wait up to two minutes for an external approval of APM ID 300400. If it is
+Wait up to two minutes for an external approval of APM ID 100403. If it is
 approved, resume execution.
 ```
 
-The agent first resolves the owner's Journey by APM ID. Run the backend simulator
+The agent first resolves the group's Journey by APM ID. Run the backend simulator
 with the returned Journey ID in another terminal. Cloud Compass then detects the
 database update and resumes without any approval action in the chat UI.
 

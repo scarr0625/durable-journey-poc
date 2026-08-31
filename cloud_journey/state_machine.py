@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from cloud_journey.models import Journey, JourneyEvent
+from cloud_journey.models import ApmGroupAccess, Journey, JourneyEvent
 
 
 class JourneyState(str, Enum):
@@ -311,15 +311,34 @@ class StateMachine:
                 session.expunge(journey)
             return journey
 
-    def get_owned_journey(
-        self, journey_id: str, owner_subject: str
-    ) -> Journey:
-        """Return an owned Journey without revealing whether another owner's exists."""
+    def get_apm_access_group(self, apm_id: str) -> str | None:
+        """Return the group mapped to an APM ID, if it is configured."""
+        with self._session_factory() as session:
+            return session.scalar(
+                select(ApmGroupAccess.group_name).where(
+                    ApmGroupAccess.apm_id == apm_id
+                )
+            )
+
+    def list_apm_ids_for_group(self, group_name: str) -> list[str]:
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(ApmGroupAccess.apm_id)
+                    .where(ApmGroupAccess.group_name == group_name)
+                    .order_by(ApmGroupAccess.apm_id)
+                )
+            )
+
+    def get_group_journey(self, journey_id: str, group_name: str) -> Journey:
+        """Return a Journey only when its APM is mapped to the caller's group."""
         with self._session_factory() as session:
             journey = session.scalar(
-                select(Journey).where(
+                select(Journey)
+                .join(ApmGroupAccess, ApmGroupAccess.apm_id == Journey.apm_id)
+                .where(
                     Journey.id == journey_id,
-                    Journey.owner_subject == owner_subject,
+                    ApmGroupAccess.group_name == group_name,
                 )
             )
             if journey is None:
@@ -327,14 +346,16 @@ class StateMachine:
             session.expunge(journey)
             return journey
 
-    def get_owned_journey_by_apm_id(
-        self, apm_id: str, owner_subject: str
+    def get_group_journey_by_apm_id(
+        self, apm_id: str, group_name: str
     ) -> Journey:
         with self._session_factory() as session:
             journey = session.scalar(
-                select(Journey).where(
+                select(Journey)
+                .join(ApmGroupAccess, ApmGroupAccess.apm_id == Journey.apm_id)
+                .where(
                     Journey.apm_id == apm_id,
-                    Journey.owner_subject == owner_subject,
+                    ApmGroupAccess.group_name == group_name,
                 )
             )
             if journey is None:

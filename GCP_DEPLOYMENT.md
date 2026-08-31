@@ -17,6 +17,7 @@ Agent Runtime (ADK AdkApp + managed chat sessions)
 Existing Cloud SQL PostgreSQL
           |
           +-- journeys (unique apm_id + owner_subject)
+          +-- apm_group_access (APM ID -> authorized group)
           +-- journey_events
           +-- journey_operations
 ```
@@ -46,6 +47,7 @@ records. Then apply the migration through the proxy:
 
 ```powershell
 psql "host=127.0.0.1 port=5432 dbname=durable_journey user=journey sslmode=disable" -v ON_ERROR_STOP=1 -f migrations/001_apm_uniqueness_and_ownership.sql
+psql "host=127.0.0.1 port=5432 dbname=durable_journey user=journey sslmode=disable" -v ON_ERROR_STOP=1 -f migrations/002_group_apm_authorization.sql
 ```
 
 The migration backfills legacy `owner_subject` values from the PoC's
@@ -224,11 +226,11 @@ In Google Cloud console:
 The equivalent route is **Agent Platform > Deployments > Durable Cloud Compass >
 Playground**.
 
-Start with a read-only database proof using an APM ID whose `owner_subject`
-matches the Playground runtime user:
+Start with a read-only database proof using a mapped APM ID and a simulated user
+from its group:
 
 ```text
-Could you give me the current status of APM ID 100200?
+I am sam. Could you give me the current status of APM ID 100401?
 ```
 
 If that succeeds, Agent Runtime is reading the same Cloud SQL database as the
@@ -236,24 +238,15 @@ local Auth Proxy configuration. Then start a new Journey in the Playground.
 
 ### Identity boundary for the PoC
 
-Every tool reads `ToolContext.user_id`, which ADK injects outside the model's tool
-arguments. A name typed in chat, including "as sam", cannot change the stored
-owner. A new session with the same runtime `user_id` can recover the Journey;
-another `user_id` receives a generic inaccessible/not-found response.
+There is deliberately no authentication provider in this revision. A user types
+a simulated identity such as `sam`; the backend binds that name once to ADK
+session state and uses the predefined demo group. This tests policy behavior but
+is not a security boundary: anyone can open a new session and claim another demo
+name. `ToolContext.user_id` is retained as creator audit data only.
 
-The Agent Runtime API lets a calling client supply `user_id`. Therefore, treat a
-direct API caller as a trusted frontend and do not let an untrusted client choose
-an arbitrary user ID. Also verify with two authorized testers that your current
-Playground release supplies distinct, stable IDs before presenting it as user
-isolation; the Playground documentation does not promise that its `user_id` is
-the signed-in user's email.
-
-For production end-user access, put the runtime behind a trusted authenticated
-frontend or register it with a Gemini Enterprise app and bind ownership to its
-verified user identity. Google documents that registered ADK agents receive the
-user's email from Gemini Enterprise. Agent Runtime's service account or Agent
-Identity is the agent workload identity and must not be reused as the human owner
-identity.
+For production, replace `SIMULATED_USERS` with group claims from a trusted
+authenticated frontend or identity provider. Keep the database-backed APM policy
+and session-switch protection, but never authorize from a name supplied in chat.
 
 ## 9. Optional SDK smoke test
 
@@ -263,13 +256,13 @@ After setting `AGENT_RESOURCE_NAME`:
 python scripts/query_remote_agent.py
 ```
 
-The SDK caller explicitly supplies `AGENT_TEST_USER`. Use the same value in a
-later invocation to model the same owner in a new session, and a different value
-to test denial without relying on the Playground's identity behavior:
+The SDK caller explicitly supplies `AGENT_TEST_USER` as ADK audit/session data.
+Authorization in this PoC comes from the simulated name in each new session, so
+use messages that select `sam`/`ivan` for same-group access and `abdur` for denial:
 
 ```powershell
 $env:AGENT_TEST_USER = "project-owner-a"
-$env:AGENT_TEST_MESSAGE = "Could you give me the current status of APM ID 100200?"
+$env:AGENT_TEST_MESSAGE = "I am sam. Could you give me the current status of APM ID 100401?"
 python scripts/query_remote_agent.py
 
 $env:AGENT_TEST_USER = "different-user-b"
@@ -278,16 +271,16 @@ python scripts/query_remote_agent.py
 
 ## 10. Verify durability in GCP
 
-1. As runtime user A, create APM `100200` in the managed Playground.
+1. As simulated user `sam`, create APM `100401` in the managed Playground.
 2. Capture inventory and generate the plan until `WAITING_FOR_APPROVAL`.
 3. Close the Playground session and create a new one.
-4. As the same runtime user A, ask: `Could you give me the current status of APM
-   ID 100200?`
+4. Select simulated user `ivan` and ask: `Could you give me the current status of
+   APM ID 100401?`
 5. Confirm that Cloud Compass reloads `WAITING_FOR_APPROVAL` from Cloud SQL.
-6. Start another new session as runtime user B and ask the same question.
-7. Confirm that user B receives only the generic inaccessible/not-found response
+6. Start another new session as simulated user `abdur` and ask the same question.
+7. Confirm that `abdur` receives only the generic inaccessible/not-found response
    and sees no APM, Journey, owner, status, plan, or history data.
-8. As user B, try to start APM `100200`; confirm creation fails generically and no
+8. As `abdur`, try to start APM `100401`; confirm creation fails generically and no
    second database row appears.
 
 Verify the database invariant directly:
@@ -295,7 +288,7 @@ Verify the database invariant directly:
 ```sql
 SELECT apm_id, COUNT(*)
 FROM journeys
-WHERE apm_id = '100200'
+WHERE apm_id = '100401'
 GROUP BY apm_id;
 ```
 

@@ -26,6 +26,15 @@ class Base(DeclarativeBase):
     pass
 
 
+class ApmGroupAccess(Base):
+    """Maps each APM ID to the one group allowed to access it."""
+
+    __tablename__ = "apm_group_access"
+
+    apm_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    group_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+
 class Journey(Base):
     __tablename__ = "journeys"
     __table_args__ = (UniqueConstraint("apm_id", name="uq_journeys_apm_id"),)

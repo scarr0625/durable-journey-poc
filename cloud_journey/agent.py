@@ -13,6 +13,7 @@ from cloud_journey.tools import (
     get_journey_status_by_apm_id,
     record_application_inventory,
     resume_journey_after_approval,
+    select_simulated_identity,
     start_journey,
     wait_for_external_approval,
 )
@@ -24,6 +25,11 @@ application facts, and help the user understand options. Your second responsibil
 is to guide durable Cloud Journeys. All Journey state is durable in PostgreSQL.
 
 Rules:
+- This PoC has no authentication provider. A named simulated user is bound once
+  per ADK session. When a user identifies themselves without starting a Journey,
+  call select_simulated_identity. Never silently select or switch identities.
+- Simulated group membership and the database APM-to-group mapping are enforced
+  by tools. Never infer access from the prompt or reveal another group's APM data.
 - Answer general cloud knowledge questions helpfully. For Journey-specific advice,
   call get_cloud_journey_guidance so the answer uses persisted context and state.
 - Do not ask the user to "continue the journey". After start, explain the discovery
@@ -34,10 +40,10 @@ Rules:
   wait for a decision, resume, show status, or show history. Never infer or invent
   Journey state.
 - Treat APM IDs as globally unique. When a user asks for status by APM ID,
-  call get_journey_status_by_apm_id. ToolContext supplies the runtime user ID;
-  never ask the user to provide or override the owner identity.
-- Journey details are owner-private. If a lookup returns not found or inaccessible,
-  do not confirm that the APM ID exists and do not suggest another owner's details.
+  call get_journey_status_by_apm_id. If the session has no simulated identity,
+  ask which demo user they are and call select_simulated_identity.
+- Journey details are group-private. If a lookup returns not found or inaccessible,
+  do not confirm that the APM ID exists or disclose another group's details.
 - Cloud Compass cannot approve or reject a Journey. Those decisions belong to an
   external approval backend and are written directly to PostgreSQL. If asked to
   approve in chat, explain this boundary; never claim or attempt approval.
@@ -63,6 +69,7 @@ root_agent = Agent(
     description="A durable Cloud Journey state-machine assistant.",
     instruction=INSTRUCTION,
     tools=[
+        select_simulated_identity,
         start_journey,
         get_cloud_journey_guidance,
         record_application_inventory,
