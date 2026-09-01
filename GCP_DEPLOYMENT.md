@@ -32,6 +32,26 @@ This revision adds `journeys.owner_subject` and a database-enforced unique APM
 ID. SQLAlchemy's `create_all()` creates these fields for a fresh database but
 does not alter an existing Cloud SQL table.
 
+For a completely empty database, apply all files in order, beginning with
+`migrations/000_initial_schema.sql`. For an existing database that already has
+the three Journey tables, do not apply `000`; use the upgrade checks and commands
+below for `001` and `002`.
+
+To intentionally discard an existing PoC database and rebuild it through a
+locally running Cloud SQL Auth Proxy, first stop agents that connect to it, then
+run:
+
+```powershell
+.\scripts\recreate_cloud_sql_database.ps1 `
+    -AdminUser postgres `
+    -ApplicationUser journey `
+    -DatabaseName durable_journey
+```
+
+This drops only the named database, not the Cloud SQL instance. The script
+requires confirmation, recreates the database with `journey` as owner, and
+applies `000`, `001`, and `002` in filename order.
+
 With the Cloud SQL Auth Proxy already running, first check for existing
 duplicates:
 

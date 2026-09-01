@@ -26,7 +26,8 @@ and the existing Cloud SQL database, follow [GCP_DEPLOYMENT.md](GCP_DEPLOYMENT.m
 ## Prerequisites
 
 - Python 3.11 or newer
-- PostgreSQL 14+ (PostgreSQL 16 is provided in `compose.yaml` for local demos)
+- A Cloud SQL for PostgreSQL 14+ instance
+- Cloud SQL Auth Proxy v2 and the PostgreSQL `psql` client
 - A Gemini API key, or Vertex AI application credentials
 
 ## Local setup
@@ -36,19 +37,70 @@ py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
 Copy-Item .env.example .env
-docker compose up -d postgres
 ```
 
-For the included container, set this value in `.env`:
+Start the Cloud SQL Auth Proxy in a separate PowerShell terminal:
+
+```powershell
+.\cloud-sql-proxy.exe --port 5432 PROJECT_ID:REGION:INSTANCE_NAME
+```
+
+Set the database connection in `.env`, using the password for the Cloud SQL
+application database user:
 
 ```text
-DATABASE_URL=postgresql+psycopg://journey:journey@127.0.0.1:5432/durable_journey
+DATABASE_URL=postgresql+psycopg://journey:URL_ENCODED_PASSWORD@127.0.0.1:5432/durable_journey
 ```
 
-For Cloud SQL, run the Cloud SQL Auth Proxy (or use a private-IP connection) and
-point `DATABASE_URL` at its PostgreSQL endpoint. The application creates the PoC
-tables on the first tool call. In production, schema migration tooling should
-replace this convenience behavior.
+### Recreate the Cloud SQL database from scratch
+
+The repository includes a baseline migration followed by the two incremental
+migrations. Stop any running agent that uses this database first. With the Cloud
+SQL Auth Proxy listening on `127.0.0.1:5432`, permanently delete and recreate
+only the `durable_journey` database by running:
+
+```powershell
+.\scripts\recreate_cloud_sql_database.ps1 `
+    -AdminUser postgres `
+    -ApplicationUser journey `
+    -DatabaseName durable_journey
+```
+
+`postgres` must be a Cloud SQL database administrator that can drop/create
+databases, and the `journey` database user must already exist on the Cloud SQL
+instance. `psql` prompts for their database passwords. The script verifies the
+proxy connection and requires typing `durable_journey` before deletion.
+
+For non-interactive disposable environments only, add `-Force`:
+
+```powershell
+.\scripts\recreate_cloud_sql_database.ps1 `
+    -AdminUser postgres `
+    -ApplicationUser journey `
+    -DatabaseName durable_journey `
+    -Force
+```
+
+The migration order is:
+
+1. `000_initial_schema.sql` — creates `journeys`, `journey_events`, and
+   `journey_operations`.
+2. `001_apm_uniqueness_and_ownership.sql` — safely preserves the previous
+   upgrade path and database uniqueness boundary.
+3. `002_group_apm_authorization.sql` — creates and seeds `apm_group_access`.
+
+After recreation, start the agent:
+
+```powershell
+adk web .
+```
+
+Then test an allowed request with `Start a journey with APM ID 100401, as sam.`
+To test denial, open a different ADK session and try APM `100403` as `sam`.
+
+The Auth Proxy exposes the local TCP endpoint; it does not create a local Docker
+database. The application can create missing PoC tables on its first tool call,
+but the migration sequence above is the reproducible setup path.
 
 Set either `GOOGLE_API_KEY` for Google AI Studio or the Vertex AI variables shown
 in `.env.example`.
