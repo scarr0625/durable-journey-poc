@@ -15,10 +15,10 @@ CREATE INDEX IF NOT EXISTS ix_apm_group_access_group_name
 -- Demo mappings for the unauthenticated PoC. Existing mappings win.
 INSERT INTO apm_group_access (apm_id, group_name)
 VALUES
-    ('100401', 'GROUP_1'),
-    ('100402', 'GROUP_1'),
-    ('100403', 'GROUP_2'),
-    ('100404', 'GROUP_2')
+    ('100501', 'GROUP_1'),
+    ('100502', 'GROUP_1'),
+    ('100503', 'GROUP_2'),
+    ('100504', 'GROUP_2')
 ON CONFLICT (apm_id) DO NOTHING;
 
 COMMIT;
