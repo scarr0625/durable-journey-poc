@@ -18,9 +18,17 @@ TRUNCATE TABLE
     journeys,
     access_group_members,
     apm_group_assignments,
-    access_groups,
-    apm_group_access
+    access_groups
 RESTART IDENTITY;
+
+-- Clear the obsolete compatibility table when it is still present. The base
+-- application no longer reads or seeds this table.
+DO $$
+BEGIN
+    IF TO_REGCLASS('public.apm_group_access') IS NOT NULL THEN
+        EXECUTE 'TRUNCATE TABLE public.apm_group_access';
+    END IF;
+END $$;
 
 INSERT INTO access_groups (id, name)
 VALUES
@@ -42,14 +50,6 @@ VALUES
     ('100403', 'GROUP_2'),
     ('100404', 'GROUP_2');
 
--- Compatibility table currently queried by cloud_journey.models.ApmGroupAccess.
-INSERT INTO apm_group_access (apm_id, group_name)
-VALUES
-    ('100401', 'GROUP_1'),
-    ('100402', 'GROUP_1'),
-    ('100403', 'GROUP_2'),
-    ('100404', 'GROUP_2');
-
 COMMIT;
 
 SELECT id, name
@@ -62,8 +62,4 @@ ORDER BY group_id, user_subject;
 
 SELECT apm_id, group_id
 FROM apm_group_assignments
-ORDER BY apm_id;
-
-SELECT apm_id, group_name
-FROM apm_group_access
 ORDER BY apm_id;

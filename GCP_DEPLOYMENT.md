@@ -16,8 +16,10 @@ Agent Runtime (ADK AdkApp + managed chat sessions)
           v
 Existing Cloud SQL PostgreSQL
           |
-          +-- journeys (unique apm_id + owner_subject)
-          +-- apm_group_access (APM ID -> authorized group)
+          +-- access_groups
+          +-- access_group_members
+          +-- apm_group_assignments
+          +-- journeys (unique apm_id + owner_subject + access_group_id)
           +-- journey_events
           +-- journey_operations
 ```
@@ -28,9 +30,10 @@ state from Cloud SQL.
 
 ## Required: migrate the existing database
 
-This revision adds `journeys.owner_subject` and a database-enforced unique APM
-ID. SQLAlchemy's `create_all()` creates these fields for a fresh database but
-does not alter an existing Cloud SQL table.
+This revision adds normalized group authorization, `journeys.owner_subject`,
+`journeys.access_group_id`, and a database-enforced unique APM ID. SQLAlchemy's
+`create_all()` creates these fields for a fresh database but does not alter an
+existing Cloud SQL table.
 
 For a completely empty database, apply all files in order, beginning with
 `migrations/000_initial_schema.sql`. For an existing database that already has

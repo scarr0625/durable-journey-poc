@@ -7,7 +7,7 @@ from google.adk.tools import FunctionTool
 
 from cloud_journey.agent import root_agent
 from cloud_journey import tools
-from cloud_journey.state_machine import DuplicateApmId
+from cloud_journey.state_machine import DuplicateApmId, JourneyPersistenceError
 from cloud_journey.tools import ApmAccessDenied
 
 
@@ -37,7 +37,21 @@ def test_apm_id_is_globally_unique_and_same_group_gets_existing(service) -> None
             requested_by="sam",
             requested_by_email="sam@example.com",
             role="PROJECT_OWNER",
+            access_group_id="GROUP_1",
             owner_subject="owner-subject-b",
+        )
+
+
+def test_non_duplicate_database_constraint_is_not_reported_as_apm_unavailable(
+    service,
+) -> None:
+    with pytest.raises(JourneyPersistenceError):
+        service.state_machine.create_journey(
+            apm_id="999999",
+            requested_by="sam",
+            requested_by_email="sam@example.com",
+            role="PROJECT_OWNER",
+            access_group_id="GROUP_DOES_NOT_EXIST",
         )
 
 

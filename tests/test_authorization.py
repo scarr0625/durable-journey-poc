@@ -65,7 +65,7 @@ def test_backend_policy_explains_group_decision(service) -> None:
     )
 
     assert owner["authorized"] is False
-    assert owner["groups"] == ["GROUP_1"]
+    assert owner["groups"] == []
     assert reviewer["authorized"] is True
     assert reviewer["groups"] == ["CLOUD_JOURNEY_APPROVERS"]
 

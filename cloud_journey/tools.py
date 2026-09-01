@@ -13,6 +13,8 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from cloud_journey.authorization import (
+    DEFAULT_ACCESS_GROUP_MEMBERS,
+    DEFAULT_ACCESS_GROUP_NAMES,
     DEFAULT_APM_GROUP_ACCESS,
     ApmAuthorizationDecision,
     AuthorizationDecision,
@@ -22,13 +24,20 @@ from cloud_journey.authorization import (
     get_simulated_user,
 )
 from cloud_journey.database import SessionLocal, init_db
-from cloud_journey.models import ApmGroupAccess, JourneyEvent, JourneyOperation
+from cloud_journey.models import (
+    AccessGroup,
+    AccessGroupMember,
+    ApmGroupAssignment,
+    JourneyEvent,
+    JourneyOperation,
+)
 from cloud_journey.state_machine import (
     Actor,
     ConcurrentTransition,
     DuplicateApmId,
     InvalidTransition,
     JourneyError,
+    JourneyPersistenceError,
     JourneyState,
     JourneyUnavailable,
     StateMachine,
@@ -97,27 +106,50 @@ class JourneyService:
     def __init__(self, session_factory: sessionmaker[Session]):
         self.session_factory = session_factory
         self.state_machine = StateMachine(session_factory)
-        self._seed_demo_apm_access()
+        self._seed_demo_group_authorization()
 
-    def _seed_demo_apm_access(self) -> None:
-        """Bootstrap the documented PoC mapping without overwriting DB-owned rows."""
-        demo_rows = {
+    def _seed_demo_group_authorization(self) -> None:
+        """Bootstrap normalized PoC groups without overwriting DB-owned rows."""
+        assignment_rows = {
             apm_id: group_name
             for group_name, apm_ids in DEFAULT_APM_GROUP_ACCESS.items()
             for apm_id in apm_ids
         }
         with self.session_factory.begin() as session:
-            existing = set(
-                session.scalars(
-                    select(ApmGroupAccess.apm_id).where(
-                        ApmGroupAccess.apm_id.in_(demo_rows)
+            existing_groups = set(session.scalars(select(AccessGroup.id)))
+            session.add_all(
+                AccessGroup(id=group_id, name=group_name)
+                for group_id, group_name in DEFAULT_ACCESS_GROUP_NAMES.items()
+                if group_id not in existing_groups
+            )
+
+        with self.session_factory.begin() as session:
+            existing_members = set(
+                session.execute(
+                    select(
+                        AccessGroupMember.group_id,
+                        AccessGroupMember.user_subject,
                     )
-                )
+                ).all()
+            )
+            member_rows = {
+                (group_id, user_subject)
+                for group_id, user_subjects in DEFAULT_ACCESS_GROUP_MEMBERS.items()
+                for user_subject in user_subjects
+            }
+            session.add_all(
+                AccessGroupMember(group_id=group_id, user_subject=user_subject)
+                for group_id, user_subject in member_rows
+                if (group_id, user_subject) not in existing_members
+            )
+
+            existing_assignments = set(
+                session.scalars(select(ApmGroupAssignment.apm_id))
             )
             session.add_all(
-                ApmGroupAccess(apm_id=apm_id, group_name=group_name)
-                for apm_id, group_name in demo_rows.items()
-                if apm_id not in existing
+                ApmGroupAssignment(apm_id=apm_id, group_id=group_id)
+                for apm_id, group_id in assignment_rows.items()
+                if apm_id not in existing_assignments
             )
 
     @staticmethod
@@ -230,9 +262,11 @@ class JourneyService:
     def require_apm_access(
         self, apm_id: str, user: SimulatedUser
     ) -> ApmAuthorizationDecision:
+        user_groups = self.state_machine.get_access_groups_for_user(user.name)
         decision = evaluate_apm_authorization(
             user=user,
             apm_id=apm_id,
+            user_groups=user_groups,
             required_group=self.state_machine.get_apm_access_group(apm_id),
         )
         if not decision.allowed:
@@ -241,21 +275,22 @@ class JourneyService:
 
     def require_group_access(self, journey_id: str, user_name: str) -> None:
         user = self._user(user_name)
-        if user.apm_group is None:
-            raise JourneyUnavailable()
-        self.state_machine.get_group_journey(journey_id, user.apm_group)
+        user_groups = self.state_machine.get_access_groups_for_user(user.name)
+        self.state_machine.get_group_journey(journey_id, user_groups)
 
     def simulated_identity(self, user_name: str) -> dict[str, Any]:
         user = self._user(user_name)
+        apm_groups = sorted(
+            self.state_machine.get_access_groups_for_user(user.name)
+        )
         return {
             "ok": True,
             "user_name": user.name,
             "role": user.role,
-            "apm_group": user.apm_group,
-            "available_apm_ids": (
-                self.state_machine.list_apm_ids_for_group(user.apm_group)
-                if user.apm_group
-                else []
+            "apm_group": apm_groups[0] if len(apm_groups) == 1 else None,
+            "apm_groups": apm_groups,
+            "available_apm_ids": self.state_machine.list_apm_ids_for_groups(
+                apm_groups
             ),
             "note": "This identity is simulated for the PoC and is not authentication.",
         }
@@ -269,13 +304,18 @@ class JourneyService:
         user = self._user(user_name)
         if user.role != "PROJECT_OWNER":
             raise ProjectOwnerRequired()
-        self.require_apm_access(apm_id, user)
+        access_decision = self.require_apm_access(apm_id, user)
+        access_group_id = access_decision.user_group
+        if access_group_id is None:
+            raise ApmAccessDenied(access_decision)
         subject = (owner_subject or user.name).strip()
         if not subject:
             raise ValueError("owner subject must not be empty")
 
         existing = self.state_machine.find_journey_by_apm_id(apm_id)
         if existing is not None:
+            if existing.access_group_id != access_group_id:
+                raise JourneyUnavailable()
             response = self._response(existing.id, [])
             response.update(
                 {
@@ -291,13 +331,17 @@ class JourneyService:
                 requested_by=user.name,
                 requested_by_email=user.email,
                 role=user.role,
+                access_group_id=access_group_id,
                 owner_subject=subject,
                 context={"apm_validation": "simulated"},
             )
         except DuplicateApmId:
             # Handles a concurrent create race after group authorization succeeded.
             existing = self.state_machine.find_journey_by_apm_id(apm_id)
-            if existing is not None:
+            if (
+                existing is not None
+                and existing.access_group_id == access_group_id
+            ):
                 response = self._response(existing.id, [])
                 response.update({"created": False, "note": "The APM Journey already exists."})
                 return response
@@ -823,9 +867,10 @@ class JourneyService:
         if not apm_id:
             raise ValueError("apm_id must not be empty")
         user = self._user(user_name)
-        decision = self.require_apm_access(apm_id, user)
+        self.require_apm_access(apm_id, user)
+        user_groups = self.state_machine.get_access_groups_for_user(user.name)
         journey = self.state_machine.get_group_journey_by_apm_id(
-            apm_id, decision.user_group or ""
+            apm_id, user_groups
         )
         response = self._response(journey.id, [])
         response["lookup"] = "apm_id"
@@ -850,6 +895,7 @@ class JourneyService:
             "version": journey.version,
             "requested_by": journey.requested_by,
             "requested_by_email": journey.requested_by_email,
+            "access_group_id": journey.access_group_id,
             "role": journey.role,
             "last_error": journey.last_error,
             "context": journey.context,
@@ -930,6 +976,13 @@ def _tool_call(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         }
     except ConcurrentTransition as exc:
         return {"ok": False, "status_code": 409, "error": "ConcurrentTransition", "message": str(exc)}
+    except JourneyPersistenceError as exc:
+        return {
+            "ok": False,
+            "status_code": 500,
+            "error": "JourneyPersistenceError",
+            "message": str(exc),
+        }
     except DuplicateApmId as exc:
         return {"ok": False, "status_code": 409, "error": "ApmIdUnavailable", "message": str(exc)}
     except ProjectOwnerRequired as exc:

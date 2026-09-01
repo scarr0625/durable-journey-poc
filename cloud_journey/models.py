@@ -26,13 +26,31 @@ class Base(DeclarativeBase):
     pass
 
 
-class ApmGroupAccess(Base):
+class AccessGroup(Base):
+    __tablename__ = "access_groups"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+
+
+class AccessGroupMember(Base):
+    __tablename__ = "access_group_members"
+
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("access_groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_subject: Mapped[str] = mapped_column(String(256), primary_key=True)
+
+
+class ApmGroupAssignment(Base):
     """Maps each APM ID to the one group allowed to access it."""
 
-    __tablename__ = "apm_group_access"
+    __tablename__ = "apm_group_assignments"
 
     apm_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    group_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("access_groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
 
 
 class Journey(Base):
@@ -47,6 +65,9 @@ class Journey(Base):
     requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
     requested_by_email: Mapped[str] = mapped_column(String(320), nullable=False)
     owner_subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    access_group_id: Mapped[str] = mapped_column(
+        ForeignKey("access_groups.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     role: Mapped[str] = mapped_column(String(40), nullable=False)
     context: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

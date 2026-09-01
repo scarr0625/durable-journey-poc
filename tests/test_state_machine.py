@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from cloud_journey.models import AccessGroup
 from cloud_journey.state_machine import (
     Actor,
     InvalidTransition,
@@ -64,12 +65,15 @@ def test_normal_journey_stops_for_approval_then_completes(service) -> None:
 
 
 def test_invalid_transition_does_not_update_database(session_factory) -> None:
+    with session_factory.begin() as session:
+        session.add(AccessGroup(id="GROUP_1", name="Test group"))
     machine = StateMachine(session_factory)
     journey = machine.create_journey(
         apm_id="123456",
         requested_by="sam",
         requested_by_email="sam@example.com",
         role="PROJECT_OWNER",
+        access_group_id="GROUP_1",
     )
 
     with pytest.raises(InvalidTransition) as error:
@@ -87,12 +91,15 @@ def test_invalid_transition_does_not_update_database(session_factory) -> None:
 
 
 def test_processing_state_can_fail_and_enter_retrying(session_factory) -> None:
+    with session_factory.begin() as session:
+        session.add(AccessGroup(id="GROUP_1", name="Test group"))
     machine = StateMachine(session_factory)
     journey = machine.create_journey(
         apm_id="123456",
         requested_by="sam",
         requested_by_email="sam@example.com",
         role="PROJECT_OWNER",
+        access_group_id="GROUP_1",
     )
     machine.transition(
         journey.id,

@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+from sqlalchemy import delete
 
 from cloud_journey import tools
+from cloud_journey.models import AccessGroupMember
 from cloud_journey.tools import ApmAccessDenied
 
 
@@ -60,6 +62,7 @@ def test_same_group_member_can_read_existing_journey(service, monkeypatch) -> No
     assert updated["current_state"] == "INVENTORY_COMPLETE"
     assert status["ok"] is True
     assert status["journey_id"] == created["journey_id"]
+    assert status["access_group_id"] == "GROUP_1"
     inventory_event = next(
         event for event in status["history"] if event["event_type"] == "CONTEXT_UPDATED"
     )
@@ -95,3 +98,16 @@ def test_unmapped_and_cross_group_apm_have_same_denial(service, monkeypatch) -> 
     assert cross_group["message"] == unmapped["message"]
     assert "100401" not in str(cross_group)
     assert "999999" not in str(unmapped)
+
+
+def test_database_membership_is_the_authorization_source(service) -> None:
+    with service.session_factory.begin() as session:
+        session.execute(
+            delete(AccessGroupMember).where(
+                AccessGroupMember.group_id == "GROUP_1",
+                AccessGroupMember.user_subject == "sam",
+            )
+        )
+
+    with pytest.raises(ApmAccessDenied):
+        service.start("100401", "sam")

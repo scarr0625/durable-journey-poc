@@ -83,11 +83,13 @@ For non-interactive disposable environments only, add `-Force`:
 
 The migration order is:
 
-1. `000_initial_schema.sql` — creates `journeys`, `journey_events`, and
-   `journey_operations`.
+1. `000_initial_schema.sql` — creates the Journey and normalized group-access
+   tables.
 2. `001_apm_uniqueness_and_ownership.sql` — safely preserves the previous
    upgrade path and database uniqueness boundary.
-3. `002_group_apm_authorization.sql` — creates and seeds `apm_group_access`.
+3. `002_group_apm_authorization.sql` — creates and seeds `access_groups`,
+   `access_group_members`, and `apm_group_assignments`, then assigns each
+   Journey an `access_group_id`.
 
 After recreation, start the agent:
 
@@ -129,8 +131,14 @@ identity inside that session is rejected. This makes authorization behavior
 testable, but a user can still open a new session and claim another name, so it
 must not be treated as production security.
 
-The `apm_group_access` table is the authorization source of truth. Fresh PoC
-databases are seeded without overwriting existing rows:
+The normalized authorization tables are the source of truth:
+
+- `access_groups` defines groups.
+- `access_group_members` maps simulated users to groups.
+- `apm_group_assignments` maps APM IDs to groups.
+- `journeys.access_group_id` records the owning group durably.
+
+Fresh PoC databases are seeded without overwriting existing rows:
 
 | Simulated group | Users | Available APM IDs |
 |---|---|---|
@@ -139,7 +147,8 @@ databases are seeded without overwriting existing rows:
 
 `journeys.owner_subject` remains an audit field containing ADK's runtime
 `ToolContext.user_id`; it is no longer the Journey access boundary. Every ADK
-read or change checks the Journey's APM ID against the session user's group.
+read or change checks `journeys.access_group_id` against the simulated user's
+database membership.
 
 This gives the intended behavior:
 
@@ -156,8 +165,8 @@ This gives the intended behavior:
 For an existing database, run
 [`migrations/001_apm_uniqueness_and_ownership.sql`](migrations/001_apm_uniqueness_and_ownership.sql),
 then [`migrations/002_group_apm_authorization.sql`](migrations/002_group_apm_authorization.sql)
-before starting this version. If an enterprise mapping table already exists,
-adapt `ApmGroupAccess` to it instead of keeping duplicate mappings.
+before starting this version. The legacy `apm_group_access` table is no longer
+read or seeded by the application.
 
 ## Approval boundary
 

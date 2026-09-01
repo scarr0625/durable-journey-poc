@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
+from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -11,7 +13,14 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from cloud_journey.models import ApmGroupAccess, Journey, JourneyEvent
+from cloud_journey.models import (
+    AccessGroupMember,
+    ApmGroupAssignment,
+    Journey,
+    JourneyEvent,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class JourneyState(str, Enum):
@@ -97,6 +106,11 @@ class DuplicateApmId(JourneyError):
         self.apm_id = apm_id
 
 
+class JourneyPersistenceError(JourneyError):
+    def __init__(self):
+        super().__init__("Unable to persist the Journey because of a database constraint")
+
+
 class JourneyUnavailable(JourneyError):
     """Non-disclosing response for missing or inaccessible Journey data."""
 
@@ -135,6 +149,7 @@ class StateMachine:
         requested_by: str,
         requested_by_email: str,
         role: str,
+        access_group_id: str,
         owner_subject: str | None = None,
         context: dict[str, Any] | None = None,
         journey_id: str | None = None,
@@ -148,6 +163,7 @@ class StateMachine:
             requested_by=requested_by,
             requested_by_email=requested_by_email,
             owner_subject=owner_subject or requested_by,
+            access_group_id=access_group_id,
             role=role,
             context=context or {},
         )
@@ -167,8 +183,25 @@ class StateMachine:
                     )
                 )
         except IntegrityError as exc:
-            raise DuplicateApmId(apm_id) from exc
+            if self._is_duplicate_apm_error(exc):
+                raise DuplicateApmId(apm_id) from exc
+            logger.exception("Journey creation failed because of a database constraint")
+            raise JourneyPersistenceError() from exc
         return journey
+
+    @staticmethod
+    def _is_duplicate_apm_error(exc: IntegrityError) -> bool:
+        original = getattr(exc, "orig", None)
+        diagnostic = getattr(original, "diag", None)
+        constraint_name = getattr(diagnostic, "constraint_name", None)
+        if constraint_name in {"uq_journeys_apm_id", "ix_journeys_apm_id"}:
+            return True
+        message = str(original or exc).lower()
+        return (
+            "unique" in message
+            and "journeys" in message
+            and "apm_id" in message
+        )
 
     def transition(
         self,
@@ -315,30 +348,45 @@ class StateMachine:
         """Return the group mapped to an APM ID, if it is configured."""
         with self._session_factory() as session:
             return session.scalar(
-                select(ApmGroupAccess.group_name).where(
-                    ApmGroupAccess.apm_id == apm_id
+                select(ApmGroupAssignment.group_id).where(
+                    ApmGroupAssignment.apm_id == apm_id
                 )
             )
 
-    def list_apm_ids_for_group(self, group_name: str) -> list[str]:
+    def get_access_groups_for_user(self, user_subject: str) -> frozenset[str]:
+        with self._session_factory() as session:
+            return frozenset(
+                session.scalars(
+                    select(AccessGroupMember.group_id).where(
+                        AccessGroupMember.user_subject == user_subject
+                    )
+                )
+            )
+
+    def list_apm_ids_for_groups(self, group_ids: Collection[str]) -> list[str]:
+        if not group_ids:
+            return []
         with self._session_factory() as session:
             return list(
                 session.scalars(
-                    select(ApmGroupAccess.apm_id)
-                    .where(ApmGroupAccess.group_name == group_name)
-                    .order_by(ApmGroupAccess.apm_id)
+                    select(ApmGroupAssignment.apm_id)
+                    .where(ApmGroupAssignment.group_id.in_(group_ids))
+                    .order_by(ApmGroupAssignment.apm_id)
                 )
             )
 
-    def get_group_journey(self, journey_id: str, group_name: str) -> Journey:
-        """Return a Journey only when its APM is mapped to the caller's group."""
+    def get_group_journey(
+        self, journey_id: str, group_ids: Collection[str]
+    ) -> Journey:
+        """Return a Journey only when it belongs to one of the caller's groups."""
+        if not group_ids:
+            raise JourneyUnavailable()
         with self._session_factory() as session:
             journey = session.scalar(
                 select(Journey)
-                .join(ApmGroupAccess, ApmGroupAccess.apm_id == Journey.apm_id)
                 .where(
                     Journey.id == journey_id,
-                    ApmGroupAccess.group_name == group_name,
+                    Journey.access_group_id.in_(group_ids),
                 )
             )
             if journey is None:
@@ -347,15 +395,16 @@ class StateMachine:
             return journey
 
     def get_group_journey_by_apm_id(
-        self, apm_id: str, group_name: str
+        self, apm_id: str, group_ids: Collection[str]
     ) -> Journey:
+        if not group_ids:
+            raise JourneyUnavailable()
         with self._session_factory() as session:
             journey = session.scalar(
                 select(Journey)
-                .join(ApmGroupAccess, ApmGroupAccess.apm_id == Journey.apm_id)
                 .where(
                     Journey.apm_id == apm_id,
-                    ApmGroupAccess.group_name == group_name,
+                    Journey.access_group_id.in_(group_ids),
                 )
             )
             if journey is None:
