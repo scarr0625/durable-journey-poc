@@ -25,15 +25,23 @@ def runtime_requirements() -> list[str]:
 
 
 def deployment_environment() -> dict[str, str]:
-    return {
+    iam_auth = os.getenv("CLOUD_SQL_IAM_AUTH", "false").strip().lower() == "true"
+    environment = {
         "GOOGLE_GENAI_USE_VERTEXAI": "TRUE",
         "JOURNEY_AGENT_MODEL": os.getenv(
             "DEPLOY_JOURNEY_AGENT_MODEL", "gemini-2.5-flash"
         ),
-        "DATABASE_URL": required("DATABASE_URL"),
+        "CLOUD_SQL_INSTANCE": required("CLOUD_SQL_INSTANCE"),
+        "CLOUD_SQL_IP_TYPE": os.getenv("CLOUD_SQL_IP_TYPE", "PUBLIC"),
+        "CLOUD_SQL_IAM_AUTH": str(iam_auth).lower(),
+        "DB_USER": required("DB_USER"),
+        "DB_NAME": required("DB_NAME"),
         "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true",
         "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
     }
+    if not iam_auth:
+        environment["DB_PASSWORD"] = required("DB_PASSWORD")
+    return environment
 
 
 def main() -> None:

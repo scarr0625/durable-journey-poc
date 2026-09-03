@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import atexit
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -81,11 +81,7 @@ def _build_cloud_sql_engine(*, echo: bool | None = None) -> Engine:
     if ip_type_name not in ip_types:
         raise RuntimeError("CLOUD_SQL_IP_TYPE must be PUBLIC, PRIVATE, or PSC")
 
-    connector = Connector(
-        ip_type=ip_types[ip_type_name],
-        enable_iam_auth=iam_auth,
-        refresh_strategy="LAZY",
-    )
+    connector = Connector()
     _cloud_sql_connector = connector
     atexit.register(connector.close)
 
@@ -99,6 +95,8 @@ def _build_cloud_sql_engine(*, echo: bool | None = None) -> Engine:
         return connector.connect(
             os.environ["CLOUD_SQL_INSTANCE"],
             "pg8000",
+            ip_type=ip_types[ip_type_name],
+            enable_iam_auth=iam_auth,
             **connection_args,
         )
 

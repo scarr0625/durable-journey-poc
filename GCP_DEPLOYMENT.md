@@ -12,7 +12,7 @@ Agent Registry Playground
           v
 Agent Runtime (ADK AdkApp + managed chat sessions)
           |
-          | DATABASE_URL / PostgreSQL
+          | Cloud SQL Python Connector / pg8000
           v
 Existing Cloud SQL PostgreSQL
           |
@@ -90,11 +90,12 @@ injected `ToolContext.user_id`.
 
 ## 1. Choose the database network path
 
-This PoC connects with a PostgreSQL `DATABASE_URL`. Its hostname and port must be
-reachable from Agent Runtime. Include the database username and URL-encoded
-password in the URL and use the SSL settings required by the database. Complete
-the network configuration before deployment or the runtime will time out while
-connecting.
+Agent Runtime connects through the Cloud SQL Python Connector using the
+instance's connection name (`project:region:instance-name`) rather than a local
+proxy endpoint, hostname, or raw public IP. The connector establishes an
+authorized, encrypted connection with the runtime service account's Application
+Default Credentials. `CLOUD_SQL_IP_TYPE` defaults to `PUBLIC`; use `PRIVATE` or
+`PSC` only when the runtime has the corresponding network path.
 
 ## 2. Set local gcloud context
 
@@ -111,6 +112,7 @@ Enable the required services:
 
 ```powershell
 gcloud services enable aiplatform.googleapis.com
+gcloud services enable sqladmin.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable telemetry.googleapis.com
 gcloud services enable logging.googleapis.com
@@ -128,6 +130,7 @@ Grant only the project roles needed by this PoC:
 
 ```powershell
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloud-compass-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/aiplatform.user"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloud-compass-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudsql.client"
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloud-compass-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/logging.logWriter"
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloud-compass-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.metricWriter"
 ```
@@ -148,14 +151,16 @@ gcloud storage buckets create gs://YOUR_UNIQUE_STAGING_BUCKET --location=YOUR_RE
 
 ## 5. Configure the database credential
 
-Create a PostgreSQL connection URL for the existing application database user.
-The database user needs `CONNECT` on the database, `USAGE` on the target schema,
-and DML/sequence access to the Journey tables. URL-encode special characters in
-the username and password.
+Use the existing PostgreSQL application user. It needs `CONNECT` on the database,
+`USAGE` on the target schema, and DML/sequence access to the Journey tables. The
+connector handles transport security and Cloud SQL instance authorization; the
+database username and password still handle PostgreSQL authentication.
 
-For this PoC, the complete URL is passed to Agent Runtime as a plain environment
-variable. Do not use this approach for a production credential; use a managed
-secret mechanism before promoting the deployment.
+For this PoC, the password is passed to Agent Runtime as a plain environment
+variable. Use a managed secret mechanism before promoting the deployment. IAM
+database authentication is also supported: set `CLOUD_SQL_IAM_AUTH=true`, omit
+`DB_PASSWORD`, configure the corresponding Cloud SQL IAM database user, and
+grant the runtime service account `roles/cloudsql.instanceUser`.
 
 ## 6. Create the deployment configuration
 
@@ -171,11 +176,18 @@ GCP_LOCATION=us-central1
 AGENT_STAGING_BUCKET=gs://your-unique-staging-bucket
 AGENT_SERVICE_ACCOUNT=cloud-compass-agent@your-project-id.iam.gserviceaccount.com
 
-DATABASE_URL=postgresql+psycopg://journey:URL_ENCODED_PASSWORD@DATABASE_HOST:5432/durable_journey
+CLOUD_SQL_INSTANCE=your-project-id:us-central1:your-instance-name
+CLOUD_SQL_IP_TYPE=PUBLIC
+CLOUD_SQL_IAM_AUTH=false
+DB_USER=journey
+DB_PASSWORD=replace-with-the-database-password
+DB_NAME=durable_journey
 ```
 
-The deploy script requires `DATABASE_URL` and includes it directly in the runtime
-environment-variable payload.
+The deploy script sends these settings to Agent Runtime. At startup, SQLAlchemy
+creates a `postgresql+pg8000` engine whose connection creator calls the Cloud SQL
+Python Connector. `DATABASE_URL` remains available for local development through
+the Auth Proxy, but is not used by the managed deployment.
 
 ## 7. Install the deployment SDK and deploy
 
@@ -286,14 +298,17 @@ Journey state.
 
 ### Database connection timeout
 
-Confirm that the host and port in `DATABASE_URL` are reachable from Agent Runtime.
-The database being reachable through a local Auth Proxy does not prove that the
-managed runtime has a route to it.
+Verify the `CLOUD_SQL_INSTANCE` connection name, confirm that the Cloud SQL Admin
+API is enabled, and ensure the runtime service account has `roles/cloudsql.client`.
+For `PRIVATE` or `PSC`, also confirm that Agent Runtime has the required network
+path. A local Auth Proxy connection does not test the managed runtime's identity
+or network.
 
 ### PostgreSQL authentication failure
 
-Verify the username, URL-encoded password, SSL parameters, and database grants in
-`DATABASE_URL`.
+Verify `DB_USER`, `DB_PASSWORD`, `DB_NAME`, and the database grants. For IAM
+database authentication, verify the IAM database user and
+`roles/cloudsql.instanceUser` grant.
 
 ### Agent deploys but tools fail on first use
 
