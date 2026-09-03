@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
-
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,29 +24,16 @@ def runtime_requirements() -> list[str]:
     return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
 
 
-def deployment_environment() -> dict[str, Any]:
-    iam_auth = os.getenv("DEPLOY_CLOUD_SQL_IAM_AUTH", "false").lower()
-    env_vars: dict[str, Any] = {
+def deployment_environment() -> dict[str, str]:
+    return {
         "GOOGLE_GENAI_USE_VERTEXAI": "TRUE",
         "JOURNEY_AGENT_MODEL": os.getenv(
             "DEPLOY_JOURNEY_AGENT_MODEL", "gemini-2.5-flash"
         ),
-        "CLOUD_SQL_INSTANCE": required("DEPLOY_CLOUD_SQL_INSTANCE"),
-        "CLOUD_SQL_IP_TYPE": os.getenv("DEPLOY_CLOUD_SQL_IP_TYPE", "PUBLIC").upper(),
-        "CLOUD_SQL_IAM_AUTH": iam_auth,
-        "DB_NAME": required("DEPLOY_DB_NAME"),
-        "DB_USER": required("DEPLOY_DB_USER"),
-        "DB_POOL_SIZE": os.getenv("DEPLOY_DB_POOL_SIZE", "5"),
-        "DB_MAX_OVERFLOW": os.getenv("DEPLOY_DB_MAX_OVERFLOW", "2"),
+        "DATABASE_URL": required("DATABASE_URL"),
         "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true",
         "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
     }
-    if iam_auth != "true":
-        env_vars["DB_PASSWORD"] = {
-            "secret": required("DB_PASSWORD_SECRET"),
-            "version": os.getenv("DB_PASSWORD_SECRET_VERSION", "latest"),
-        }
-    return env_vars
 
 
 def main() -> None:
